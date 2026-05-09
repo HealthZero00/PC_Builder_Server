@@ -41,24 +41,22 @@ def _make_options() -> ChromiumOptions:
     co = ChromiumOptions()
     co.auto_port()
     co.set_browser_path(BROWSER_PATH)
-    co.mute(True)
-    co.incognito(True)
 
-    # Базовые флаги для работы на VPS под root
-    co.set_argument("--headless=new")
-    co.set_argument("--no-sandbox")
-    co.set_argument("--disable-setuid-sandbox")
-    co.set_argument("--disable-dev-shm-usage")  # Критично: использует /tmp вместо RAM
-    co.set_argument("--disable-gpu")
+    # Отключаем всё лишнее
+    co.set_argument('--headless=new')
+    co.set_argument('--no-sandbox')
+    co.set_argument('--disable-gpu')
+    co.set_argument('--disable-dev-shm-usage')  # Использовать /tmp вместо RAM
+    co.set_argument('--disable-extensions')
+    co.set_argument('--disable-software-rasterizer')
 
-    # Жесткое ограничение аппетитов
-    co.set_argument("--js-flags=--max-old-space-size=128")  # Снизил с 256 до 128
-    co.set_argument("--disable-extensions")
-    co.set_argument("--disable-component-update")
-    co.set_argument("--no-first-run")
+    # Лимит памяти для JS (снижаем до минимума)
+    co.set_argument("--js-flags=--max-old-space-size=128")
 
-    # Стратегия загрузки
+    # Важно: увеличиваем таймауты загрузки
     co.set_argument("--page-load-strategy=eager")
+
+    # Блокировка картинок
     co.set_pref("profile.managed_default_content_settings.images", 2)
 
     return co
@@ -80,11 +78,11 @@ def _is_alive(page: ChromiumPage) -> bool:
 
 
 def _reconnect(page: ChromiumPage) -> ChromiumPage:
-    """Закрывает старый браузер и возвращает новый."""
-    log.warning("Переподключение браузера...")
+    log.warning("Ожидание перед переподключением...")
     _safe_quit(page)
-    time.sleep(1)
-    return ChromiumPage(_make_options())
+    time.sleep(3) # Даем системе время освободить Swap
+    new_page = ChromiumPage(_make_options())
+    return new_page
 
 
 # ═══════════════════════════════════════════════════════════
