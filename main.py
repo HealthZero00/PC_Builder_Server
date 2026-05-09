@@ -1,177 +1,189 @@
-import logging
-import threading
 import time
-from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import threading
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 import parser_engine
+import build_validator
+import json
 
-# ─────────────────── логирование ──────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+cache = {}
 
-# ─────────────────── конфиг ───────────────────────────────
-PARALLEL_CATEGORIES = 2   # сколько категорий парсить одновременно
-                           # > 2 — Citilink может забанить по IP, осторожно
-
-URLS: dict[str, str] = {
-    "Видеокарты":        "https://www.citilink.ru/catalog/videokarty/",
-    "Процессоры":        "https://www.citilink.ru/catalog/processory/",
+URLS = {
+    "Видеокарты": "https://www.citilink.ru/catalog/videokarty/",
+    "Процессоры": "https://www.citilink.ru/catalog/processory/",
     "Материнские платы": "https://www.citilink.ru/catalog/materinskie-platy/",
-    "Оперативная память":"https://www.citilink.ru/catalog/moduli-pamyati/",
-    "Блоки питания":     "https://www.citilink.ru/catalog/bloki-pitaniya/",
-    "Корпуса":           "https://www.citilink.ru/catalog/korpusa/",
-    "SSD":               "https://www.citilink.ru/catalog/ssd-nakopiteli/",
-    "Кулеры":            "https://www.citilink.ru/catalog/sistemy-ohlazhdeniya-processora/",
+    "Оперативная память": "https://www.citilink.ru/catalog/moduli-pamyati/",
+    "Блоки питания": "https://www.citilink.ru/catalog/bloki-pitaniya/",
+    "Корпуса": "https://www.citilink.ru/catalog/korpusa/",
+    "SSD": "https://www.citilink.ru/catalog/ssd-nakopiteli/",
+    "Кулеры": "https://www.citilink.ru/catalog/sistemy-ohlazhdeniya-processora/"
 }
 
-# ─────────────────── потоко-безопасный кеш ────────────────
-_cache: dict[str, list] = {}
-_cache_lock = threading.Lock()
-
-# флаг — парсинг ещё идёт
-_parsing_in_progress = threading.Event()
-
-
-def _set_category(category: str, data: list) -> None:
-    with _cache_lock:
-        _cache[category] = data
-
-
-def _get_cache_snapshot() -> dict:
-    with _cache_lock:
-        return dict(_cache)
-
-
-# ─────────────────── фоновый парсинг ──────────────────────
-
-def _parse_category(category: str, url: str) -> tuple[str, list]:
-    """Обёртка для ThreadPoolExecutor — возвращает (категория, данные)."""
-    try:
-        data = parser_engine.scrape_citilink(url, category)
-        return category, data
-    except Exception as e:
-        log.error("Ошибка категории [%s]: %s", category, e)
-        return category, []
-
-
-def _run_parsing() -> None:
-    """
-    Запускает PARALLEL_CATEGORIES категорий одновременно.
-    По завершении каждой — сразу пишет в кеш и сохраняет файл.
-    """
-    _parsing_in_progress.set()
-    log.info("=== Парсинг запущен (параллельно: %d) ===", PARALLEL_CATEGORIES)
-    start = time.time()
-
-    with ThreadPoolExecutor(max_workers=PARALLEL_CATEGORIES) as pool:
-        futures = {
-            pool.submit(_parse_category, cat, url): cat
-            for cat, url in URLS.items()
-        }
-
-        for future in as_completed(futures):
-            category, data = future.result()
-            if data:
-                _set_category(category, data)
-                # сохраняем снапшот после каждой готовой категории
-                parser_engine.save_to_file(_get_cache_snapshot())
-                log.info("[%s] ✓ %d товаров записано в кеш", category, len(data))
-            else:
-                log.warning("[%s] Данных нет, пропускаем", category)
-
-    elapsed = time.time() - start
-    log.info("=== Парсинг завершён за %.1f сек ===", elapsed)
-    _parsing_in_progress.clear()
-
-
-# ─────────────────── lifespan ─────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Грузим кеш с диска если есть
-    saved = parser_engine.load_from_file()
-    if saved:
-        with _cache_lock:
-            _cache.update(saved)
-        log.info("Загружен кеш с диска (%d категорий)", len(saved))
+    """Инициализация сервера и запуск парсинга в фоне"""
+    global cache
 
-    # Запускаем фоновый парсинг
-    thread = threading.Thread(target=_run_parsing, daemon=True, name="parser-bg")
-    thread.start()
+    print("\n" + "=" * 70)
+    print(">>> [SYSTEM] PC BUILDER API ЗАПУЩЕН")
+    print("=" * 70)
 
-    yield  # сервер работает
+    # Загружаем кэш если существует
+    cache = parser_engine.load_from_file() or {}
+    if cache:
+        print(f">>> [✓] Загружен кэш с {len(cache)} категориями")
+    else:
+        print(">>> [!] Кэш не найден — начинаем парсинг...")
 
-    # при остановке — дать потоку спокойно завершиться (или убить daemon)
-    log.info("Сервер останавливается...")
+    def run_background_parsing():
+        """Фоновый парсинг данных"""
+        for category, url in URLS.items():
+            try:
+                print(f"\n>>> [PARSING] Категория: {category}")
+                data = parser_engine.scrape_citilink(url, category)
+                if data:
+                    cache[category] = data
+                    parser_engine.save_to_file(cache)
+                    print(f"    [✓] {category}: {len(data)} товаров")
+            except Exception as e:
+                print(f"    [ERROR] {category}: {e}")
+            time.sleep(2)  # Вежливая задержка между запросами
 
+        print("\n" + "=" * 70)
+        print(">>> [✓] ПАРСИНГ ЗАВЕРШЕН")
+        print("=" * 70 + "\n")
 
-# ─────────────────── FastAPI app ──────────────────────────
+    # Запускаем парсинг в отдельном потоке
+    parsing_thread = threading.Thread(target=run_background_parsing, daemon=True)
+    parsing_thread.start()
+
+    yield  # API работает пока сервер живой
+
+    print(">>> [SYSTEM] Сервер завершает работу...")
+
 
 app = FastAPI(
-    title="PC Components API",
-    version="2.0",
-    lifespan=lifespan,
+    title="PC Builder API",
+    description="API для сборки и проверки совместимости ПК",
+    version="1.0",
+    lifespan=lifespan
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+
+def _find_component(component_id: int | None, category: str) -> dict | None:
+    """Поиск компонента по ID в кэше."""
+    if component_id is None:
+        return None
+    for comp in cache.get(category, []):
+        if comp.get("id") == component_id:
+            return comp
+    return None
 
 
 @app.get("/components")
 async def get_components(category: str):
     """
-    Возвращает товары категории из кеша.
-    Если категория ещё парсится — отдаёт то, что уже есть (может быть пусто).
+    Получить компоненты по категории.
+
+    Категории: Процессоры, Материнские платы, Видеокарты,
+              Оперативная память, Блоки питания, Корпуса, SSD, Кулеры
     """
-    with _cache_lock:
-        data = _cache.get(category)
-
-    if data is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Категория '{category}' не найдена. Доступные: {list(URLS.keys())}",
-        )
-    return data
-
-
-@app.get("/components/all")
-async def get_all_components():
-    """Отдаёт весь кеш целиком — удобно для дебага."""
-    return _get_cache_snapshot()
-
-
-@app.get("/status")
-async def get_status():
-    """Показывает что уже готово и идёт ли парсинг."""
-    with _cache_lock:
-        ready = {cat: len(items) for cat, items in _cache.items()}
+    components = cache.get(category, [])
     return {
-        "parsing_in_progress": _parsing_in_progress.is_set(),
-        "ready_categories": ready,
-        "total_products": sum(ready.values()),
+        "category": category,
+        "count": len(components),
+        "components": components
     }
 
 
-# ─────────────────── точка входа ──────────────────────────
+@app.get("/compatibility-check")
+async def check_compatibility(
+        cpu_id: int = None,
+        motherboard_id: int = None,
+        gpu_id: int = None,
+        ram_id: int = None,
+        psu_id: int = None,
+        case_id: int = None,
+        cooler_id: int = None,
+        ssd_id: int = None,
+):
+    """
+    Проверить совместимость сборки ПК.
+
+    Принимает ID компонентов (можно получить из /components)
+    и возвращает подробный отчёт о совместимости.
+    """
+    # Собираем компоненты из кэша по ID
+    components = {
+        "cpu":    _find_component(cpu_id,         "Процессоры"),
+        "mb":     _find_component(motherboard_id,  "Материнские платы"),
+        "gpu":    _find_component(gpu_id,          "Видеокарты"),
+        "ram":    _find_component(ram_id,          "Оперативная память"),
+        "psu":    _find_component(psu_id,          "Блоки питания"),
+        "case":   _find_component(case_id,         "Корпуса"),
+        "cooler": _find_component(cooler_id,       "Кулеры"),
+        "ssd":    _find_component(ssd_id,          "SSD"),
+    }
+
+    # CPU и MB — обязательные компоненты
+    if not components["cpu"] or not components["mb"]:
+        return {
+            "compatible": False,
+            "status": "CRITICAL",
+            "critical": [{"code": "MISSING_REQUIRED",
+                          "title": "Выберите процессор и материнскую плату",
+                          "detail": "CPU и материнская плата обязательны для проверки совместимости.",
+                          "field": "cpu/mb"}],
+            "warning":  [],
+            "advisory": [],
+            "summary":  {}
+        }
+
+    # Запускаем полный аудит через build_validator
+    result = build_validator.check_compatibility(components)
+
+    # Адаптируем ответ: добавляем поле compatible для удобства клиента
+    result["compatible"] = result["status"] != "CRITICAL"
+    return result
+
+
+@app.get("/search")
+async def search_component(query: str, category: str = None):
+    """
+    Поиск компонента по названию.
+
+    Опционально фильтрует по категории.
+    """
+    results = []
+    query_lower = query.lower()
+    search_categories = [category] if category else URLS.keys()
+
+    for cat in search_categories:
+        for comp in cache.get(cat, []):
+            if query_lower in comp.get("name", "").lower():
+                results.append({"category": cat, "component": comp})
+
+    return {
+        "query":   query,
+        "found":   len(results),
+        "results": results[:10]  # Лимит 10 результатов
+    }
+
+
+@app.get("/cache-status")
+async def get_cache_status():
+    """Получить статус кэша."""
+    return {
+        "status":           "loaded" if cache else "empty",
+        "categories":       {cat: len(comps) for cat, comps in cache.items()},
+        "total_components": sum(len(comps) for comps in cache.values())
+    }
+
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-        log_level="info",
-    )
+    print("\n>>> [API] Стартуем на http://0.0.0.0:8000")
+    print(">>> [API] Документация: http://localhost:8000/docs\n")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

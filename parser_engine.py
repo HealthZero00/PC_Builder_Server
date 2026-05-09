@@ -14,7 +14,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ───────────────────────── конфиг ─────────────────────────
-PAGES_LIMIT        = 10   # максимум страниц на категорию
+PAGES_LIMIT        = 1   # максимум страниц на категорию
 PRODUCTS_PER_PAGE  = 1   # сколько товаров брать со страницы (None = все)
 BATCH_SIZE         = 8    # вкладок одновременно
 SCROLL_STEPS       = 4    # прокруток вниз перед сбором
@@ -220,6 +220,7 @@ def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
                 extracted = _extract_logic(category_name, product["name"], specs)
 
                 results.append({
+                    "id":            abs(hash(product["name"] + category_name)) % (10 ** 9),
                     "name":          product["name"],
                     "category":      category_name,
                     "priceCitilink": price_text,
@@ -488,19 +489,31 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
 
     # ──────────────────────────────────────────────────────────────────────
     elif category == "Корпуса":
-        r["formFactor"]          = _find_form_factor(full)
+        # formFactor корпуса — ищем ТОЛЬКО в ключе про МП/типоразмер,
+        # иначе "Форм-фактор БП: ATX" ложно делает корпус ATX-совместимым.
+        case_ff_raw = (val("форм-фактор совместимых") or
+                       val("типоразмер") or
+                       val("форм-фактор"))
+        r["formFactor"]         = _find_form_factor(case_ff_raw)
+
         r["maxGpuLength"]        = mm(val("длина видеокарты")) or mm(val("макс. длина видеокарты"))
-        r["maxCpuCoolerHeight"]  = mm(val("высота кулера")) or mm(val("макс. высота кулера")) or \
-                                    mm(val("высота процессорного кулера"))
+        r["maxCpuCoolerHeight"]  = (mm(val("высота кулера")) or
+                                    mm(val("макс. высота кулера")) or
+                                    mm(val("высота процессорного кулера")))
         r["maxPsuLength"]        = mm(val("длина блока питания")) or mm(val("глубина блока питания"))
-        r["supportedMbFormats"]  = _find_supported_mb_formats(full)
+
+        # supportedMbFormats — из ключей про МП, не из full (там есть "ATX" от БП)
+        mb_fmt_raw = val("форм-фактор совместимых") or val("совместимые мп") or val("форм-фактор")
+        r["supportedMbFormats"]  = _find_supported_mb_formats(mb_fmt_raw)
 
     # ──────────────────────────────────────────────────────────────────────
     elif category == "Кулеры":
-        r["socket"]      = _find_socket(full)
-        r["maxTdp"]      = watt(val("рассеиваемая мощность")) or watt(val("tdp")) or \
-                            first_int(val("tdp"), 30, 500)
-        r["coolerHeight"]= mm(val("высота")) or mm(val("высота кулера"))
+        # Кулеры поддерживают несколько сокетов — берём весь список из поля "Совместимость"
+        compat_raw = val("совместимость") or val("сокет")
+        r["socket"]       = _find_all_sockets(compat_raw) if compat_raw else _find_socket(full)
+        r["maxTdp"]       = watt(val("рассеиваемая мощность")) or watt(val("tdp")) or \
+                             first_int(val("tdp"), 30, 500)
+        r["coolerHeight"] = mm(val("высота кулера")) or mm(val("высота"))
 
     # ──────────────────────────────────────────────────────────────────────
     elif category == "SSD":
@@ -515,11 +528,35 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
 
 # ─────────────────────── вспомогательные парсеры ─────────────────────────────
 
+def _normalize_lga(text: str) -> str:
+    """'LGA 1700' -> 'LGA1700' (убираем пробел внутри LGA-обозначения)."""
+    return re.sub(r'(?i)lga\s+(\d+)', r'LGA\1', text)
+
+
 def _find_socket(text: str) -> str:
-    for s in ["AM5", "AM4", "LGA1851", "LGA1700", "LGA1200", "LGA2066", "TR5", "SP3"]:
-        if s in text.upper():
+    norm = _normalize_lga(text).upper()
+    for s in ["AM5", "AM4", "LGA1851", "LGA1700", "LGA1200", "LGA2066", "LGA2011", "LGA1366", "TR5", "SP3"]:
+        if s in norm:
             return s
     return "---"
+
+
+def _find_all_sockets(text: str) -> str:
+    """
+    Возвращает ВСЕ поддерживаемые сокеты через запятую (для кулеров).
+    Пример: "AM4,AM5,LGA1200,LGA1700,LGA1851"
+    Валидатор делает split(",") и проверяет cpu_socket in supported.
+    """
+    norm = _normalize_lga(text).upper()
+    candidates = [
+        "AM5", "AM4", "AM3+", "AM3", "AM2+", "AM2",
+        "FM2+", "FM2", "FM1",
+        "LGA1851", "LGA1700", "LGA1200", "LGA2066",
+        "LGA2011", "LGA1366", "LGA1156", "LGA1155", "LGA1151", "LGA1150",
+        "TR5", "SP3",
+    ]
+    found = [s for s in candidates if s in norm]
+    return ",".join(found) if found else "---"
 
 
 def _find_ddr(text: str, socket: str = "") -> str:
@@ -681,7 +718,19 @@ def load_from_file(filename: str = "components.json") -> dict | None:
         return None
     try:
         with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Обратная совместимость: добавляем id если его нет (старый кэш без fix)
+        for category, items in data.items():
+            for item in items:
+                if "id" not in item:
+                    item["id"] = abs(hash(item.get("name", "") + category)) % (10 ** 9)
+                # Кулеры: старый парсер писал только первый сокет → перезаписываем
+                # из specs["Совместимость"] если там несколько сокетов.
+                if category == "Кулеры" and "specs" in item:
+                    compat = item["specs"].get("Совместимость", "")
+                    if compat:
+                        item["socket"] = _find_all_sockets(compat)
+        return data
     except Exception as e:
         log.error("Не удалось загрузить %s: %s", filename, e)
         return None
