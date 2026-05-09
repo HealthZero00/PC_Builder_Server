@@ -16,10 +16,10 @@ log = logging.getLogger(__name__)
 # ───────────────────────── конфиг ─────────────────────────
 PAGES_LIMIT        = 20   # максимум страниц на категорию
 PRODUCTS_PER_PAGE  = 36  # сколько товаров брать со страницы (None = все)
-BATCH_SIZE         = 4    # вкладок одновременно
-SCROLL_STEPS       = 2    # прокруток вниз перед сбором
+BATCH_SIZE         = 2    # вкладок одновременно
+SCROLL_STEPS       = 1    # прокруток вниз перед сбором
 SCROLL_PAUSE       = 0.3  # пауза между прокрутками (сек)
-PAGE_LOAD_PAUSE    = 1.5  # пауза после загрузки страницы
+PAGE_LOAD_PAUSE    = 0.8  # пауза после загрузки страницы
 BATCH_LOAD_PAUSE   = 1.0  # пауза после открытия пачки вкладок
 # ──────────────────────────────────────────────────────────
 
@@ -27,27 +27,19 @@ BATCH_LOAD_PAUSE   = 1.0  # пауза после открытия пачки в
 def _make_options(load_images: bool = True) -> ChromiumOptions:
     co = ChromiumOptions()
     co.auto_port()
-
-    # 1. РЕЖИМ БЕЗ ОКНА (Обязательно для VPS)
-    co.set_argument('--headless')
-    #
-    # # 2. РАБОТА ПОД ROOT (Обязательно для VPS)
+    co.set_argument('--headless')  # Безголовый режим
     co.set_argument('--no-sandbox')
+    co.set_argument('--disable-gpu')
+    co.set_argument('--disable-dev-shm-usage')
 
-    # Остальные полезные настройки
-    co.mute(True)
-    co.incognito(True)
-    co.set_browser_path("/usr/bin/chromium-browser")
-    # co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-    co.set_argument("--disable-blink-features=AutomationControlled")
-    co.set_argument("--disable-gpu")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-extensions")
-    co.set_argument("--page-load-strategy=eager")
+    # Отключаем расширения и лишние фичи
+    co.set_argument('--disable-extensions')
+    co.set_argument('--mute-audio')
 
-    # Настройка картинок (на сервере лучше ставить False, чтобы парсило быстрее)
-    img_policy = 1 if load_images else 2
-    co.set_pref("profile.managed_default_content_settings.images", img_policy)
+    # Если картинки нужны только для получения ссылок,
+    # но не для визуальной проверки в браузере, можно попробовать:
+    if not load_images:
+        co.set_argument('--blink-settings=imagesEnabled=false')
 
     return co
 
@@ -537,6 +529,24 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
 
 
 # ─────────────────────── вспомогательные парсеры ─────────────────────────────
+# Пример оптимизированного сбора внутри цикла по товарам:
+def parse_product_minimal(card):
+    try:
+        # Картинка (берем src или data-src для обхода lazy-load)
+        img_tag = card.ele('tag:img', timeout=1)
+        img_url = img_tag.attr('src') if img_tag else None
+
+        # Если в src заглушка, пробуем data-src
+        if img_url and 'base64' in img_url:
+            img_url = img_tag.attr('data-src')
+
+        return {
+            "name": card.ele('.product_name', timeout=1).text,
+            "price": card.ele('.price_id', timeout=1).text,
+            "image": img_url
+        }
+    except:
+        return None
 
 def _normalize_lga(text: str) -> str:
     """'LGA 1700' -> 'LGA1700' (убираем пробел внутри LGA-обозначения)."""
