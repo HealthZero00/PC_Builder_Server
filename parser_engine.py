@@ -29,16 +29,16 @@ def _make_options(load_images: bool = True) -> ChromiumOptions:
     co.auto_port()
 
     # 1. РЕЖИМ БЕЗ ОКНА (Обязательно для VPS)
-    # co.set_argument('--headless')
+    co.set_argument('--headless')
     #
     # # 2. РАБОТА ПОД ROOT (Обязательно для VPS)
-    # co.set_argument('--no-sandbox')
+    co.set_argument('--no-sandbox')
 
     # Остальные полезные настройки
     co.mute(True)
     co.incognito(True)
-    # co.set_browser_path("/usr/bin/chromium-browser")
-    co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+    co.set_browser_path("/usr/bin/chromium-browser")
+    # co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
     co.set_argument("--disable-blink-features=AutomationControlled")
     co.set_argument("--disable-gpu")
     co.set_argument("--disable-dev-shm-usage")
