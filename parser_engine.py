@@ -15,12 +15,12 @@ log = logging.getLogger(__name__)
 
 # ───────────────────────── конфиг ─────────────────────────
 PAGES_LIMIT        = 20   # максимум страниц на категорию
-PRODUCTS_PER_PAGE  = 36   # сколько товаров брать со страницы (None = все)
+PRODUCTS_PER_PAGE  = 36  # сколько товаров брать со страницы (None = все)
 BATCH_SIZE         = 4    # вкладок одновременно
-SCROLL_STEPS       = 4    # прокруток вниз перед сбором
-SCROLL_PAUSE       = 0.5  # пауза между прокрутками (сек)
-PAGE_LOAD_PAUSE    = 3.5  # пауза после загрузки страницы
-BATCH_LOAD_PAUSE   = 2.0  # пауза после открытия пачки вкладок
+SCROLL_STEPS       = 2    # прокруток вниз перед сбором
+SCROLL_PAUSE       = 0.3  # пауза между прокрутками (сек)
+PAGE_LOAD_PAUSE    = 1.5  # пауза после загрузки страницы
+BATCH_LOAD_PAUSE   = 1.0  # пауза после открытия пачки вкладок
 # ──────────────────────────────────────────────────────────
 
 
@@ -29,16 +29,16 @@ def _make_options(load_images: bool = True) -> ChromiumOptions:
     co.auto_port()
 
     # 1. РЕЖИМ БЕЗ ОКНА (Обязательно для VPS)
-    co.set_argument('--headless')
-
-    # 2. РАБОТА ПОД ROOT (Обязательно для VPS)
-    co.set_argument('--no-sandbox')
+    # co.set_argument('--headless')
+    #
+    # # 2. РАБОТА ПОД ROOT (Обязательно для VPS)
+    # co.set_argument('--no-sandbox')
 
     # Остальные полезные настройки
     co.mute(True)
     co.incognito(True)
-    co.set_browser_path("/usr/bin/chromium-browser")
-
+    # co.set_browser_path("/usr/bin/chromium-browser")
+    co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
     co.set_argument("--disable-blink-features=AutomationControlled")
     co.set_argument("--disable-gpu")
     co.set_argument("--disable-dev-shm-usage")
@@ -140,6 +140,9 @@ def scrape_citilink(url: str, category_name: str) -> list[dict]:
 
                     full_url = href if href.startswith("http") else f"https://www.citilink.ru{href}"
 
+                    if not full_url.endswith('/properties/'):
+                        full_url = full_url.rstrip('/') + '/properties/'
+
                     image_url = ""
                     img_el = item.ele("css:img", timeout=0.3)
                     if img_el:
@@ -197,25 +200,25 @@ def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
             except Exception as e:
                 log.debug("Не удалось открыть вкладку %s: %s", p["url"], e)
 
-        time.sleep(BATCH_LOAD_PAUSE)
+        time.sleep(1.5)
 
         # раскрываем «Все характеристики» во всех вкладках сразу
-        for entry in tabs:
-            try:
-                entry["tab"].run_js(
-                    """
-                    document.querySelectorAll('button').forEach(btn => {
-                        const t = btn.innerText || '';
-                        if (t.includes('Все характеристики') || t.includes('больше')) {
-                            btn.click();
-                        }
-                    });
-                    """
-                )
-            except Exception:
-                pass
-
-        time.sleep(1.2)
+        # for entry in tabs:
+        #     try:
+        #         entry["tab"].run_js(
+        #             """
+        #             document.querySelectorAll('button').forEach(btn => {
+        #                 const t = btn.innerText || '';
+        #                 if (t.includes('Все характеристики') || t.includes('больше')) {
+        #                     btn.click();
+        #                 }
+        #             });
+        #             """
+        #         )
+        #     except Exception:
+        #         pass
+        #
+        # time.sleep(1.2)
 
         # собираем данные
         for entry in tabs:
