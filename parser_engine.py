@@ -50,14 +50,11 @@ def _make_options() -> ChromiumOptions:
     co.set_argument("--disable-setuid-sandbox")
 
     # экономия памяти
-    co.set_argument("--disable-gpu")
-    co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--disable-extensions")
-    co.set_argument("--disable-background-networking")
-    co.set_argument("--disable-default-apps")
-    co.set_argument("--disable-sync")
-    co.set_argument("--no-first-run")
-    co.set_argument("--disable-blink-features=AutomationControlled")
+    co.set_argument('--headless=new')  # Обновленный headless режим
+    co.set_argument('--no-sandbox')  # Отключаем песочницу (обязательно для root)
+    co.set_argument('--disable-gpu')  # Отключаем графическое ускорение
+    co.set_argument('--disable-dev-shm-usage')  # Используем /tmp вместо /dev/shm (исправляет краши на малом RAM)
+    co.set_argument('--remote-debugging-pipe')
 
     # ограничиваем V8 heap (JS движок) — критично при 1 GB RAM
     co.set_argument("--js-flags=--max-old-space-size=256")
