@@ -12,75 +12,51 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ───────────────────────── конфиг ─────────────────────────
-PAGES_LIMIT = 20
-PRODUCTS_PER_PAGE = 36
-BATCH_SIZE = 2  # ← УМЕНЬШЕНО: меньше вкладок = меньше RAM
-SCROLL_STEPS = 2
-SCROLL_PAUSE = 0.3
-PAGE_LOAD_PAUSE = 1.5
-BATCH_LOAD_PAUSE = 1.0
-
-
-# ──────────────────────────────────────────────────────────
+# ───────────────────────── конфиг (ОПТИМИЗАЦИЯ под 1ГБ / 1 ядро) ─────────────────────────
+PAGES_LIMIT        = 10     # максимум страниц на категорию
+PRODUCTS_PER_PAGE  = 20     # сколько товаров брать со страницы
+BATCH_SIZE         = 1      # ВАЖНО: не батчим вкладки — 1 за раз
+SCROLL_STEPS       = 1
+SCROLL_PAUSE       = 0.2
+PAGE_LOAD_PAUSE    = 1.0
+# ────────────────────────────────────────────────────────────────────────────────────────────
 
 
 def _make_options(load_images: bool = True) -> ChromiumOptions:
+    """
+    Максимально лёгкие настройки Chromium для VPS 1GB / 1 ядро.
+    Картинки НЕ отключаем (нужны).
+    """
     co = ChromiumOptions()
     co.auto_port()
 
-    # Headless режим
-    co.set_argument('--headless=new')  # новый headless (меньше багов)
+    # Headless новый режим
+    co.set_argument('--headless=new')
     co.set_argument('--no-sandbox')
-    co.set_argument('--disable-dev-shm-usage')  # использует /tmp вместо /dev/shm
-
-    # ═══ КРИТИЧНЫЕ ОПТИМИЗАЦИИ ДЛЯ 1GB RAM ═══
-    co.set_argument('--single-process')  # все в одном процессе
     co.set_argument('--disable-gpu')
-    co.set_argument('--disable-software-rasterizer')
+    co.set_argument('--disable-dev-shm-usage')
     co.set_argument('--disable-extensions')
     co.set_argument('--disable-background-networking')
-    co.set_argument('--disable-background-timer-throttling')
-    co.set_argument('--disable-backgrounding-occluded-windows')
-    co.set_argument('--disable-breakpad')
-    co.set_argument('--disable-component-extensions-with-background-pages')
-    co.set_argument('--disable-features=TranslateUI,BlinkGenPropertyTrees')
-    co.set_argument('--disable-ipc-flooding-protection')
-    co.set_argument('--disable-renderer-backgrounding')
-    co.set_argument('--metrics-recording-only')
-    co.set_argument('--no-first-run')
-    co.set_argument('--enable-features=NetworkService,NetworkServiceInProcess')
-    co.set_argument('--disable-hang-monitor')
-    co.set_argument('--disable-prompt-on-repost')
     co.set_argument('--disable-sync')
-    co.set_argument('--disable-domain-reliability')
-    co.set_argument('--disable-client-side-phishing-detection')
-    co.set_argument('--disable-component-update')
+    co.set_argument('--disable-translate')
+    co.set_argument('--disable-notifications')
+    co.set_argument('--disable-infobars')
+    co.set_argument('--disable-popup-blocking')
 
-    # Лимит памяти (мегабайты)
-    co.set_argument('--max-old-space-size=256')  # V8 heap для JS
-    co.set_argument('--js-flags=--max-old-space-size=256')
+    # Картинки включены
+    co.set_argument('--blink-settings=imagesEnabled=true')
 
-    # Кэш в памяти минимальный
-    co.set_argument('--disk-cache-size=1')
-    co.set_argument('--media-cache-size=1')
+    # Экономия памяти / процессов
+    co.set_argument('--renderer-process-limit=1')
+    co.set_argument('--single-process')   # 🔥 КРИТИЧНО для 1ГБ
+    co.set_argument('--no-zygote')
+    co.set_argument('--memory-pressure-off')
 
-    # Headless = нет UI элементов
-    co.set_argument('--window-size=1024,768')
-
-    co.mute(True)
-    co.incognito(True)
     co.set_browser_path("/usr/bin/chromium-browser")
-    co.set_argument("--disable-blink-features=AutomationControlled")
 
-    # Картинки
+    # Политика изображений (на всякий случай)
     img_policy = 1 if load_images else 2
     co.set_pref("profile.managed_default_content_settings.images", img_policy)
-
-    # Отключаем ненужное
-    co.set_pref("profile.default_content_setting_values.notifications", 2)
-    co.set_pref("profile.managed_default_content_settings.stylesheet", 1)  # CSS нужен
-    co.set_pref("profile.managed_default_content_settings.javascript", 1)  # JS нужен
 
     return co
 
@@ -100,25 +76,16 @@ def _is_alive(page: ChromiumPage) -> bool:
         return False
 
 
-# ═══ НОВАЯ ФУНКЦИЯ: Принудительная очистка памяти ═══
-def _force_gc(page: ChromiumPage):
-    """Принудительная сборка мусора в браузере."""
-    try:
-        page.run_js("""
-            if (window.gc) { window.gc(); }
-            // Очистка кэшей
-            if (window.caches) {
-                window.caches.keys().then(names => {
-                    names.forEach(name => window.caches.delete(name));
-                });
-            }
-        """)
-    except Exception:
-        pass
-
+# ─────────────────── сбор каталога ───────────────────────
 
 def scrape_citilink(url: str, category_name: str) -> list[dict]:
+    """
+    Проходит по страницам каталога, собирает карточки товаров.
+    Затем для каждого товара открывает страницу свойств и собирает цену + характеристики.
+    Работает в ОДНОМ ChromiumPage без вкладок.
+    """
     all_results: list[dict] = []
+
     co = _make_options(load_images=True)
     page = ChromiumPage(co)
 
@@ -128,10 +95,10 @@ def scrape_citilink(url: str, category_name: str) -> list[dict]:
         for current_page in range(1, PAGES_LIMIT + 1):
             target_url = url if current_page == 1 else f"{url.rstrip('/')}/?p={current_page}"
 
+            # Переподключение если сессия умерла
             if not _is_alive(page):
                 log.warning("[%s] Сессия разорвана, переподключение...", category_name)
                 _safe_quit(page)
-                time.sleep(2)  # пауза перед новым браузером
                 co = _make_options(load_images=True)
                 page = ChromiumPage(co)
 
@@ -142,24 +109,27 @@ def scrape_citilink(url: str, category_name: str) -> list[dict]:
                 log.error("[%s] Не удалось загрузить %s: %s", category_name, target_url, e)
                 break
 
+            # На первой странице пробуем переключить в подробный режим каталога
             if current_page == 1:
                 try:
                     label = page.ele('css:label[for="Подробный режим каталога-list"]', timeout=4)
                     if label:
                         label.click()
-                        time.sleep(1.5)
+                        time.sleep(1.0)
                 except Exception:
                     pass
 
             log.info("[%s] Страница %d", category_name, current_page)
 
+            # Прокрутка для подгрузки lazy-load
             for _ in range(SCROLL_STEPS):
                 page.scroll.down(900)
                 time.sleep(SCROLL_PAUSE)
 
+            # Сбор карточек товаров
             items = (
-                    page.eles('css:[data-meta-name="SnippetProductHorizontalLayout"]')
-                    or page.eles('css:[data-meta-product-id]')
+                page.eles('css:[data-meta-name="SnippetProductHorizontalLayout"]')
+                or page.eles('css:[data-meta-product-id]')
             )
 
             if not items:
@@ -182,6 +152,7 @@ def scrape_citilink(url: str, category_name: str) -> list[dict]:
                     if not full_url.endswith('/properties/'):
                         full_url = full_url.rstrip('/') + '/properties/'
 
+                    # картинка
                     image_url = ""
                     img_el = item.ele("css:img", timeout=0.3)
                     if img_el:
@@ -202,19 +173,39 @@ def scrape_citilink(url: str, category_name: str) -> list[dict]:
 
             log.info("[%s] Стр.%d — собрано %d товаров", category_name, current_page, len(product_data))
 
-            # Батчевая обработка
-            for batch_start in range(0, len(product_data), BATCH_SIZE):
-                batch = product_data[batch_start: batch_start + BATCH_SIZE]
-                batch_results = _process_batch(batch, category_name)
-                all_results.extend(batch_results)
+            # ── ОБРАБОТКА ТОВАРОВ ПО ОДНОМУ (без вкладок, без батчей) ──
+            for product in product_data:
+                try:
+                    # Загружаем страницу товара
+                    page.get(product["url"])
+                    time.sleep(0.8)
 
-                # ═══ ОЧИСТКА ПАМЯТИ ПОСЛЕ КАЖДОГО БАТЧА ═══
-                _force_gc(page)
-                time.sleep(0.5)
+                    # Собираем характеристики и цену
+                    specs = _collect_specs(page)
+                    price_text = _collect_price(page)
 
-            # ═══ ОЧИСТКА ПАМЯТИ ПОСЛЕ КАЖДОЙ СТРАНИЦЫ ═══
-            _force_gc(page)
-            time.sleep(1.5)
+                    # Извлекаем структурированные поля совместимости
+                    extracted = _extract_logic(category_name, product["name"], specs)
+
+                    # Формируем запись
+                    all_results.append({
+                        "id": abs(hash(product["name"] + category_name)) % (10 ** 9),
+                        "name": product["name"],
+                        "category": category_name,
+                        "priceCitilink": price_text,
+                        "priceDNS": "---",
+                        "imageUrl": product["image"],
+                        "productUrl": product["url"],
+                        **extracted,
+                        "specs": specs,
+                    })
+
+                    log.info("  ✓ %s", product["name"][:50])
+
+                except Exception as e:
+                    log.debug("Ошибка товара %s: %s", product["name"][:40], e)
+
+            time.sleep(0.5)
 
     except Exception as e:
         log.error("[%s] Критическая ошибка: %s", category_name, e)
@@ -225,51 +216,7 @@ def scrape_citilink(url: str, category_name: str) -> list[dict]:
     return all_results
 
 
-def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
-    """
-    ОПТИМИЗИРОВАНО: переиспользуем одну вкладку вместо открытия N вкладок.
-    """
-    co = _make_options(load_images=False)
-    results: list[dict] = []
-    page = ChromiumPage(co)
-
-    try:
-        # ═══ ВМЕСТО МНОЖЕСТВА ВКЛАДОК — ОДНА ВКЛАДКА ═══
-        for p in product_data:
-            try:
-                page.get(p["url"])
-                time.sleep(0.8)  # короче чем раньше
-
-                specs = _collect_specs(page)
-                price_text = _collect_price(page)
-                extracted = _extract_logic(category_name, p["name"], specs)
-
-                results.append({
-                    "id": abs(hash(p["name"] + category_name)) % (10 ** 9),
-                    "name": p["name"],
-                    "category": category_name,
-                    "priceCitilink": price_text,
-                    "priceDNS": "---",
-                    "imageUrl": p["image"],
-                    "productUrl": p["url"],
-                    **extracted,
-                    "specs": specs,
-                })
-                log.info("  ✓ %s", p["name"][:50])
-
-                # Очистка после каждого товара
-                _force_gc(page)
-
-            except Exception as e:
-                log.debug("Ошибка обработки %s: %s", p["name"][:40], e)
-
-    except Exception as e:
-        log.error("Ошибка батча: %s", e)
-    finally:
-        _safe_quit(page)
-
-    return results
-
+# ─────────────── сбор данных со страницы товара ─────────────────
 
 def _collect_specs(tab) -> dict:
     specs = {}
@@ -302,42 +249,46 @@ def _collect_price(tab) -> str:
     return "---"
 
 
-# ═══ ВСЕ ОСТАЛЬНЫЕ ФУНКЦИИ БЕЗ ИЗМЕНЕНИЙ ═══
+# ─────────────────────────────────────────────────────────────────────────────
+#  ИЗВЛЕЧЕНИЕ ХАРАКТЕРИСТИК (полная схема совместимости)
+#  Все поля всегда присутствуют → фронт не падает по KeyError
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _empty_compat() -> dict:
     return {
-        "socket": "---",
-        "ramType": "---",
-        "ramSlots": 0,
-        "ramMaxFreq": 0,
-        "ramHeight": 0,
-        "ramCapacity": 0,
-        "tdp": 0,
-        "maxTdp": 0,
-        "coolerHeight": 0,
-        "psuWattage": 0,
-        "psuFormFactor": "---",
-        "psuLength": 0,
-        "cpuPowerPin": "---",
-        "gpuPowerPin": "---",
-        "formFactor": "---",
-        "pciVersion": "---",
-        "m2Slots": 0,
-        "m2Types": [],
-        "gpuLength": 0,
-        "gpuHeight": 0,
-        "gpuSlots": 0,
-        "gpuTdp": 0,
-        "gpuReqPsu": 0,
-        "gpuPciVersion": "---",
-        "vram": 0,
-        "gpuChipset": "---",
-        "maxGpuLength": 0,
-        "maxCpuCoolerHeight": 0,
-        "maxPsuLength": 0,
-        "supportedMbFormats": [],
-        "ssdInterface": "---",
-        "ssdFormFactor": "---",
-        "ssdCapacityGb": 0,
+        "socket":              "---",
+        "ramType":             "---",
+        "ramSlots":            0,
+        "ramMaxFreq":          0,
+        "ramHeight":           0,
+        "ramCapacity":         0,
+        "tdp":                 0,
+        "maxTdp":              0,
+        "coolerHeight":        0,
+        "psuWattage":          0,
+        "psuFormFactor":       "---",
+        "psuLength":           0,
+        "cpuPowerPin":         "---",
+        "gpuPowerPin":         "---",
+        "formFactor":          "---",
+        "pciVersion":          "---",
+        "m2Slots":             0,
+        "m2Types":             [],
+        "gpuLength":           0,
+        "gpuHeight":           0,
+        "gpuSlots":            0,
+        "gpuTdp":              0,
+        "gpuReqPsu":           0,
+        "gpuPciVersion":       "---",
+        "vram":                0,
+        "gpuChipset":          "---",
+        "maxGpuLength":        0,
+        "maxCpuCoolerHeight":  0,
+        "maxPsuLength":        0,
+        "supportedMbFormats":  [],
+        "ssdInterface":        "---",
+        "ssdFormFactor":       "---",
+        "ssdCapacityGb":       0,
     }
 
 
@@ -347,6 +298,7 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
     cv = {k: v.lower() for k, v in c.items()}
     full = (name + " " + " ".join(cv.keys()) + " " + " ".join(cv.values())).lower()
 
+    # ── утилиты парсинга ─────────────────────────────────────────────────────
     def val(key_fragment: str) -> str:
         for k, v in cv.items():
             if key_fragment in k:
@@ -368,24 +320,30 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
                 return v
         return 0
 
+    # ── логика по категориям ─────────────────────────────────────────────────
     if category == "Процессоры":
-        r["socket"] = _find_socket(full)
+        r["socket"]  = _find_socket(full)
         r["ramType"] = _find_ddr(full, r["socket"])
-        r["tdp"] = watt(val("тепловыделение")) or watt(val("tdp")) or first_int(val("tdp"), 10, 500)
+        r["tdp"]     = watt(val("тепловыделение")) or watt(val("tdp")) or first_int(val("tdp"), 10, 500)
 
     elif category == "Видеокарты":
         r["gpuChipset"] = c.get("видеочипсет", "").split(",")[0].strip() or name
+
         vram_str = val("объем видеопамяти") or val("память")
         m = re.search(r"(\d+)\s*гб", vram_str, re.I)
         r["vram"] = int(m.group(1)) if m else 0
-        r["gpuTdp"] = watt(val("максимальное энергопотребление")) or watt(val("энергопотребление")) or watt(val("tdp"))
-        r["gpuReqPsu"] = watt(val("рекомендуемая мощность")) or watt(val("рекомендовано")) or watt(val("питание"))
-        if r["gpuReqPsu"] == 0:
-            r["gpuReqPsu"] = watt(full)
+
+        r["gpuTdp"]   = watt(val("максимальное энергопотребление")) or \
+                         watt(val("энергопотребление")) or watt(val("tdp"))
+        r["gpuReqPsu"]= watt(val("рекомендуемая мощность")) or \
+                         watt(val("рекомендовано")) or watt(val("питание")) or watt(full)
+
         pin_str = val("разъемы дополнительного питания") or val("питание")
         r["gpuPowerPin"] = _parse_gpu_pin(pin_str)
+
         r["gpuLength"] = mm(val("длина видеокарты")) or _find_gpu_length(full)
         r["gpuHeight"] = mm(val("высота видеокарты"))
+
         slots_str = val("конструкция системы охлаждения")
         if "трёхслот" in slots_str or "трехслот" in slots_str or "3-slot" in slots_str:
             r["gpuSlots"] = 3
@@ -393,65 +351,82 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
             r["gpuSlots"] = 2
         elif "однослот" in slots_str or "1-slot" in slots_str:
             r["gpuSlots"] = 1
+
         r["gpuPciVersion"] = _find_pci_version(full)
 
     elif category == "Материнские платы":
-        r["socket"] = _find_socket(full)
+        r["socket"]     = _find_socket(full)
         r["formFactor"] = _find_form_factor(full)
-        r["ramType"] = _find_ddr(full)
+        r["ramType"]    = _find_ddr(full)
         r["pciVersion"] = _find_pci_version(full)
+
         slots_raw = val("количество слотов памяти") or val("слотов памяти") or val("слоты памяти")
         r["ramSlots"] = first_int(slots_raw, 1, 8)
+
         freq_raw = val("максимальная частота памяти") or val("частота памяти")
         r["ramMaxFreq"] = first_int(freq_raw, 800, 12000)
+
         r["cpuPowerPin"] = _parse_cpu_pin(val("разъем питания процессора") or val("питание процессора"))
+
         m2_raw = val("количество разъемов m.2") or val("разъемов m.2") or val("m.2")
         r["m2Slots"] = first_int(m2_raw, 0, 8)
         r["m2Types"] = _find_m2_types(full)
 
     elif category == "Оперативная память":
-        r["ramType"] = _find_ddr(full)
+        r["ramType"]     = _find_ddr(full)
         r["ramCapacity"] = first_int(val("объем") or val("память"), 1, 256)
+
         freq_raw = val("частота") or val("тактовая частота")
         r["ramMaxFreq"] = first_int(freq_raw, 800, 12000)
+
         height_raw = val("высота") or val("высота радиатора")
         r["ramHeight"] = mm(height_raw) or first_int(height_raw, 20, 80)
 
     elif category == "Блоки питания":
-        r["psuWattage"] = watt(val("мощность")) or first_int(val("мощность"), 200, 3000)
-        r["formFactor"] = _find_psu_form_factor(full)
-        r["psuLength"] = mm(val("глубина")) or mm(val("длина"))
-        r["cpuPowerPin"] = _parse_cpu_pin(
-            val("разъем cpu") or val("разъемов cpu") or val("питания cpu") or val("разъем 8 pin"))
-        r["gpuPowerPin"] = _parse_gpu_pin(
-            val("разъем pcie") or val("разъемов pcie") or val("разъем 6+2") or val("12vhpwr") or val("разъем 16"))
+        r["psuWattage"]   = watt(val("мощность")) or first_int(val("мощность"), 200, 3000)
+        r["psuFormFactor"] = _find_psu_form_factor(full)
+        r["psuLength"]    = mm(val("глубина")) or mm(val("длина"))
+
+        r["cpuPowerPin"]  = _parse_cpu_pin(
+            val("разъем cpu") or val("разъемов cpu") or val("питания cpu") or val("разъем 8 pin")
+        )
+        r["gpuPowerPin"]  = _parse_gpu_pin(
+            val("разъем pcie") or val("разъемов pcie") or val("разъем 6+2") or
+            val("12vhpwr") or val("разъем 16")
+        )
 
     elif category == "Корпуса":
         case_ff_raw = (val("форм-фактор совместимых") or val("типоразмер") or val("форм-фактор"))
-        r["formFactor"] = _find_form_factor(case_ff_raw)
-        r["maxGpuLength"] = mm(val("длина видеокарты")) or mm(val("макс. длина видеокарты"))
-        r["maxCpuCoolerHeight"] = (mm(val("высота кулера")) or mm(val("макс. высота кулера")) or mm(
-            val("высота процессорного кулера")))
-        r["maxPsuLength"] = mm(val("длина блока питания")) or mm(val("глубина блока питания"))
+        r["formFactor"]         = _find_form_factor(case_ff_raw)
+
+        r["maxGpuLength"]        = mm(val("длина видеокарты")) or mm(val("макс. длина видеокарты"))
+        r["maxCpuCoolerHeight"]  = (mm(val("высота кулера")) or
+                                    mm(val("макс. высота кулера")) or
+                                    mm(val("высота процессорного кулера")))
+        r["maxPsuLength"]        = mm(val("длина блока питания")) or mm(val("глубина блока питания"))
+
         mb_fmt_raw = val("форм-фактор совместимых") or val("совместимые мп") or val("форм-фактор")
-        r["supportedMbFormats"] = _find_supported_mb_formats(mb_fmt_raw)
+        r["supportedMbFormats"]  = _find_supported_mb_formats(mb_fmt_raw)
 
     elif category == "Кулеры":
         compat_raw = val("совместимость") or val("сокет")
-        r["socket"] = _find_all_sockets(compat_raw) if compat_raw else _find_socket(full)
-        r["maxTdp"] = watt(val("рассеиваемая мощность")) or watt(val("tdp")) or first_int(val("tdp"), 30, 500)
+        r["socket"]       = _find_all_sockets(compat_raw) if compat_raw else _find_socket(full)
+        r["maxTdp"]       = watt(val("рассеиваемая мощность")) or watt(val("tdp")) or \
+                             first_int(val("tdp"), 30, 500)
         r["coolerHeight"] = mm(val("высота кулера")) or mm(val("высота"))
 
     elif category == "SSD":
-        r["ssdInterface"] = _find_ssd_interface(full)
+        r["ssdInterface"]  = _find_ssd_interface(full)
         r["ssdFormFactor"] = _find_ssd_form_factor(full)
+
         cap_str = val("объем") or val("ёмкость") or val("емкость")
         r["ssdCapacityGb"] = _parse_capacity_gb(cap_str or full)
 
     return r
 
 
-# Вспомогательные функции (без изменений)
+# ─────────────────────── вспомогательные парсеры ─────────────────────────────
+
 def _normalize_lga(text: str) -> str:
     return re.sub(r'(?i)lga\s+(\d+)', r'LGA\1', text)
 
@@ -466,9 +441,13 @@ def _find_socket(text: str) -> str:
 
 def _find_all_sockets(text: str) -> str:
     norm = _normalize_lga(text).upper()
-    candidates = ["AM5", "AM4", "AM3+", "AM3", "AM2+", "AM2", "FM2+", "FM2", "FM1",
-                  "LGA1851", "LGA1700", "LGA1200", "LGA2066", "LGA2011", "LGA1366",
-                  "LGA1156", "LGA1155", "LGA1151", "LGA1150", "TR5", "SP3"]
+    candidates = [
+        "AM5", "AM4", "AM3+", "AM3", "AM2+", "AM2",
+        "FM2+", "FM2", "FM1",
+        "LGA1851", "LGA1700", "LGA1200", "LGA2066",
+        "LGA2011", "LGA1366", "LGA1156", "LGA1155", "LGA1151", "LGA1150",
+        "TR5", "SP3",
+    ]
     found = [s for s in candidates if s in norm]
     return ",".join(found) if found else "---"
 
@@ -493,9 +472,9 @@ def _find_pci_version(text: str) -> str:
 
 def _find_form_factor(text: str) -> str:
     for label, patterns in [
-        ("E-ATX", [r"e-atx"]),
-        ("ATX", [r"\batx\b"]),
-        ("mATX", [r"matx", r"micro-atx", r"m-atx"]),
+        ("E-ATX",    [r"e-atx"]),
+        ("ATX",      [r"\batx\b"]),
+        ("mATX",     [r"matx", r"micro-atx", r"m-atx"]),
         ("Mini-ITX", [r"mini-itx"]),
         ("Flex-ATX", [r"flex-atx"]),
     ]:
@@ -518,9 +497,9 @@ def _find_psu_form_factor(text: str) -> str:
 def _find_supported_mb_formats(text: str) -> list[str]:
     found = []
     mapping = [
-        ("E-ATX", r"e-atx"),
-        ("ATX", r"\batx\b"),
-        ("mATX", r"matx|micro-atx|m-atx"),
+        ("E-ATX",    r"e-atx"),
+        ("ATX",      r"\batx\b"),
+        ("mATX",     r"matx|micro-atx|m-atx"),
         ("Mini-ITX", r"mini-itx"),
     ]
     for label, pattern in mapping:
@@ -614,12 +593,15 @@ def _find_gpu_length(text: str) -> int:
     return max(lengths) if lengths else 0
 
 
+# ─────────────────── файловые утилиты ────────────────────
+
 def load_from_file(filename: str = "components.json") -> dict | None:
     if not os.path.exists(filename):
         return None
     try:
         with open(filename, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # Обратная совместимость: добавляем id + корректируем socket для кулеров
         for category, items in data.items():
             for item in items:
                 if "id" not in item:
@@ -641,3 +623,21 @@ def save_to_file(data: dict, filename: str = "components.json") -> None:
         log.info("Сохранено → %s", filename)
     except Exception as e:
         log.error("Ошибка сохранения %s: %s", filename, e)
+
+
+if __name__ == "__main__":
+    # Тестовый запуск одной категории (для отладки)
+    test_urls = {
+        "Процессоры": "https://www.citilink.ru/catalog/processory/",
+        "Видеокарты": "https://www.citilink.ru/catalog/videokarty/",
+        "Материнские платы": "https://www.citilink.ru/catalog/materinskie-platy/",
+        "Оперативная память": "https://www.citilink.ru/catalog/moduli-pamyati/",
+        "Блоки питания": "https://www.citilink.ru/catalog/bloki-pitaniya/",
+        "Корпуса": "https://www.citilink.ru/catalog/korpusa/",
+        "SSD": "https://www.citilink.ru/catalog/ssd-nakopiteli/",
+        "Кулеры": "https://www.citilink.ru/catalog/sistemy-ohlazhdeniya-processora/"
+    }
+    # Запусти только нужную категорию:
+    cat = "Процессоры"
+    data = scrape_citilink(test_urls[cat], cat)
+    save_to_file({cat: data})
