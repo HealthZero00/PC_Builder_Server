@@ -39,32 +39,26 @@ BROWSER_PATH         = "/usr/bin/chromium-browser"
 
 def _make_options() -> ChromiumOptions:
     co = ChromiumOptions()
-    co.auto_port()                        # уникальный порт — без конфликтов
+    co.auto_port()
     co.set_browser_path(BROWSER_PATH)
     co.mute(True)
     co.incognito(True)
 
-    # обязательно для VPS/root
-    co.set_argument("--headless")
+    # Базовые флаги для работы на VPS под root
+    co.set_argument("--headless=new")
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-setuid-sandbox")
+    co.set_argument("--disable-dev-shm-usage")  # Критично: использует /tmp вместо RAM
+    co.set_argument("--disable-gpu")
 
-    # экономия памяти
-    co.set_argument('--headless=new')  # Обновленный headless режим
-    co.set_argument('--no-sandbox')  # Отключаем песочницу (обязательно для root)
-    co.set_argument('--disable-gpu')  # Отключаем графическое ускорение
-    co.set_argument('--disable-dev-shm-usage')  # Используем /tmp вместо /dev/shm (исправляет краши на малом RAM)
-    co.set_argument('--remote-debugging-pipe')
+    # Жесткое ограничение аппетитов
+    co.set_argument("--js-flags=--max-old-space-size=128")  # Снизил с 256 до 128
+    co.set_argument("--disable-extensions")
+    co.set_argument("--disable-component-update")
+    co.set_argument("--no-first-run")
 
-    # ограничиваем V8 heap (JS движок) — критично при 1 GB RAM
-    co.set_argument("--js-flags=--max-old-space-size=256")
-
-    # eager = не ждём полной загрузки, достаточно DOM
+    # Стратегия загрузки
     co.set_argument("--page-load-strategy=eager")
-
-    # КАРТИНКИ ОТКЛЮЧЕНЫ для экономии RAM и трафика.
-    # Важно: src-атрибут в DOM всё равно проставляется JS,
-    # поэтому imageUrl мы извлекаем корректно.
     co.set_pref("profile.managed_default_content_settings.images", 2)
 
     return co
