@@ -37,6 +37,8 @@ def _make_options(load_images: bool = True) -> ChromiumOptions:
     # Остальные полезные настройки
     co.mute(True)
     co.incognito(True)
+    co.set_browser_path("/usr/bin/chromium-browser")
+
     co.set_argument("--disable-blink-features=AutomationControlled")
     co.set_argument("--disable-gpu")
     co.set_argument("--disable-dev-shm-usage")
