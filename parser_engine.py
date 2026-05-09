@@ -26,22 +26,27 @@ BATCH_LOAD_PAUSE   = 2.0  # пауза после открытия пачки в
 
 def _make_options(load_images: bool = True) -> ChromiumOptions:
     co = ChromiumOptions()
-    co.auto_port()          # ← каждый экземпляр получает свой уникальный порт.
-                            #   без этого все ChromiumPage коннектятся к одному
-                            #   браузеру на порту 9222 — отсюда дубли и хаос.
-    co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+    co.auto_port()
+
+    # 1. РЕЖИМ БЕЗ ОКНА (Обязательно для VPS)
+    co.set_argument('--headless')
+
+    # 2. РАБОТА ПОД ROOT (Обязательно для VPS)
+    co.set_argument('--no-sandbox')
+
+    # Остальные полезные настройки
     co.mute(True)
     co.incognito(True)
     co.set_argument("--disable-blink-features=AutomationControlled")
-    co.set_argument("--no-sandbox")
     co.set_argument("--disable-gpu")
     co.set_argument("--disable-dev-shm-usage")
-    co.set_argument("--start-maximized")
     co.set_argument("--disable-extensions")
-    co.set_argument("--disable-component-update")
     co.set_argument("--page-load-strategy=eager")
+
+    # Настройка картинок (на сервере лучше ставить False, чтобы парсило быстрее)
     img_policy = 1 if load_images else 2
     co.set_pref("profile.managed_default_content_settings.images", img_policy)
+
     return co
 
 
