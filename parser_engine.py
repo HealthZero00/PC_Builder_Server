@@ -42,21 +42,20 @@ def _make_options() -> ChromiumOptions:
     co.auto_port()
     co.set_browser_path(BROWSER_PATH)
 
-    # Отключаем всё лишнее
+    # Максимальный аскетизм
     co.set_argument('--headless=new')
     co.set_argument('--no-sandbox')
+    co.set_argument('--disable-setuid-sandbox')
+    co.set_argument('--disable-dev-shm-usage')  # Обязательно!
     co.set_argument('--disable-gpu')
-    co.set_argument('--disable-dev-shm-usage')  # Использовать /tmp вместо RAM
-    co.set_argument('--disable-extensions')
     co.set_argument('--disable-software-rasterizer')
+    co.set_argument('--no-first-run')
+    co.set_argument('--no-default-browser-check')
 
-    # Лимит памяти для JS (снижаем до минимума)
+    # Лимит памяти для JS (еще ниже)
     co.set_argument("--js-flags=--max-old-space-size=128")
 
-    # Важно: увеличиваем таймауты загрузки
-    co.set_argument("--page-load-strategy=eager")
-
-    # Блокировка картинок
+    # Отключаем загрузку всего, кроме текста
     co.set_pref("profile.managed_default_content_settings.images", 2)
 
     return co
@@ -78,11 +77,11 @@ def _is_alive(page: ChromiumPage) -> bool:
 
 
 def _reconnect(page: ChromiumPage) -> ChromiumPage:
-    log.warning("Ожидание перед переподключением...")
+    """Закрывает старый браузер и возвращает новый."""
+    log.warning("Переподключение браузера...")
     _safe_quit(page)
-    time.sleep(3) # Даем системе время освободить Swap
-    new_page = ChromiumPage(_make_options())
-    return new_page
+    time.sleep(1)
+    return ChromiumPage(_make_options())
 
 
 # ═══════════════════════════════════════════════════════════
@@ -252,6 +251,15 @@ def _collect_specs(page: ChromiumPage) -> dict:
         pass
     return specs
 
+def get_page_safely():
+    for i in range(3):
+        try:
+            return ChromiumPage(_make_options())
+        except Exception as e:
+            log.warning(f"Попытка {i+1} не удалась, чистим процессы...")
+            os.system("pkill -9 chromium")
+            time.sleep(5) # Даем время системе "продышаться"
+    raise Exception("Совсем всё плохо, браузер не стартует")
 
 def _collect_price(page: ChromiumPage) -> str:
     try:
