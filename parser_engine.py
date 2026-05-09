@@ -14,9 +14,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ───────────────────────── конфиг ─────────────────────────
-PAGES_LIMIT        = 1   # максимум страниц на категорию
-PRODUCTS_PER_PAGE  = 1   # сколько товаров брать со страницы (None = все)
-BATCH_SIZE         = 8    # вкладок одновременно
+PAGES_LIMIT        = None   # максимум страниц на категорию
+PRODUCTS_PER_PAGE  = None   # сколько товаров брать со страницы (None = все)
+BATCH_SIZE         = 4    # вкладок одновременно
 SCROLL_STEPS       = 4    # прокруток вниз перед сбором
 SCROLL_PAUSE       = 0.5  # пауза между прокрутками (сек)
 PAGE_LOAD_PAUSE    = 3.5  # пауза после загрузки страницы
