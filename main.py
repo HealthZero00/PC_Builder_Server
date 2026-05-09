@@ -2,13 +2,12 @@ import time
 import threading
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import parser_engine
 import build_validator
-import json
 
 cache = {}
+cache_lock = threading.Lock()  # защита от race condition при параллельном чтении/записи
 
 URLS = {
     "Видеокарты": "https://www.citilink.ru/catalog/videokarty/",
@@ -24,14 +23,12 @@ URLS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Инициализация сервера и запуск парсинга в фоне"""
     global cache
 
     print("\n" + "=" * 70)
     print(">>> [SYSTEM] PC BUILDER API ЗАПУЩЕН")
     print("=" * 70)
 
-    # Загружаем кэш если существует
     cache = parser_engine.load_from_file() or {}
     if cache:
         print(f">>> [✓] Загружен кэш с {len(cache)} категориями")
@@ -39,28 +36,30 @@ async def lifespan(app: FastAPI):
         print(">>> [!] Кэш не найден — начинаем парсинг...")
 
     def run_background_parsing():
-        """Фоновый парсинг данных"""
         for category, url in URLS.items():
             try:
                 print(f"\n>>> [PARSING] Категория: {category}")
                 data = parser_engine.scrape_citilink(url, category)
                 if data:
-                    cache[category] = data
+                    with cache_lock:
+                        cache[category] = data
+                    # Сохраняем вне лока — IO не блокирует кэш
                     parser_engine.save_to_file(cache)
                     print(f"    [✓] {category}: {len(data)} товаров")
             except Exception as e:
                 print(f"    [ERROR] {category}: {e}")
-            time.sleep(2)  # Вежливая задержка между запросами
+
+            # Увеличили паузу — даём браузеру умереть и освободить RAM
+            time.sleep(4)
 
         print("\n" + "=" * 70)
         print(">>> [✓] ПАРСИНГ ЗАВЕРШЕН")
         print("=" * 70 + "\n")
 
-    # Запускаем парсинг в отдельном потоке
     parsing_thread = threading.Thread(target=run_background_parsing, daemon=True)
     parsing_thread.start()
 
-    yield  # API работает пока сервер живой
+    yield
 
     print(">>> [SYSTEM] Сервер завершает работу...")
 
@@ -91,10 +90,12 @@ async def get_components(category: str):
     Категории: Процессоры, Материнские платы, Видеокарты,
               Оперативная память, Блоки питания, Корпуса, SSD, Кулеры
     """
-    components = cache.get(category, [])
+    with cache_lock:
+        components = list(cache.get(category, []))  # копия — не держим лок пока FastAPI сериализует
+
     return {
-        "category": category,
-        "count": len(components),
+        "category":  category,
+        "count":     len(components),
         "components": components
     }
 
@@ -116,9 +117,8 @@ async def check_compatibility(
     Принимает ID компонентов (можно получить из /components)
     и возвращает подробный отчёт о совместимости.
     """
-    # Собираем компоненты из кэша по ID
     components = {
-        "cpu":    _find_component(cpu_id,         "Процессоры"),
+        "cpu":    _find_component(cpu_id,          "Процессоры"),
         "mb":     _find_component(motherboard_id,  "Материнские платы"),
         "gpu":    _find_component(gpu_id,          "Видеокарты"),
         "ram":    _find_component(ram_id,          "Оперативная память"),
@@ -128,7 +128,6 @@ async def check_compatibility(
         "ssd":    _find_component(ssd_id,          "SSD"),
     }
 
-    # CPU и MB — обязательные компоненты
     if not components["cpu"] or not components["mb"]:
         return {
             "compatible": False,
@@ -142,10 +141,7 @@ async def check_compatibility(
             "summary":  {}
         }
 
-    # Запускаем полный аудит через build_validator
     result = build_validator.check_compatibility(components)
-
-    # Адаптируем ответ: добавляем поле compatible для удобства клиента
     result["compatible"] = result["status"] != "CRITICAL"
     return result
 
@@ -157,33 +153,49 @@ async def search_component(query: str, category: str = None):
 
     Опционально фильтрует по категории.
     """
-    results = []
     query_lower = query.lower()
-    search_categories = [category] if category else URLS.keys()
+    search_categories = [category] if category else list(URLS.keys())
+    results = []
 
-    for cat in search_categories:
-        for comp in cache.get(cat, []):
-            if query_lower in comp.get("name", "").lower():
-                results.append({"category": cat, "component": comp})
+    with cache_lock:
+        for cat in search_categories:
+            for comp in cache.get(cat, []):
+                if query_lower in comp.get("name", "").lower():
+                    results.append({"category": cat, "component": comp})
+                    if len(results) >= 10:  # останавливаемся сразу как набрали 10
+                        break
+            if len(results) >= 10:
+                break
 
     return {
         "query":   query,
         "found":   len(results),
-        "results": results[:10]  # Лимит 10 результатов
+        "results": results
     }
 
 
 @app.get("/cache-status")
 async def get_cache_status():
     """Получить статус кэша."""
+    with cache_lock:
+        categories = {cat: len(comps) for cat, comps in cache.items()}
+        total = sum(categories.values())
+
     return {
         "status":           "loaded" if cache else "empty",
-        "categories":       {cat: len(comps) for cat, comps in cache.items()},
-        "total_components": sum(len(comps) for comps in cache.values())
+        "categories":       categories,
+        "total_components": total
     }
 
 
 if __name__ == "__main__":
     print("\n>>> [API] Стартуем на http://0.0.0.0:8000")
     print(">>> [API] Документация: http://localhost:8000/docs\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="warning",   # было info — меньше IO на диск
+        workers=1,             # явно 1 воркер — на 1 vCPU больше не нужно
+        loop="asyncio"
+    )
