@@ -559,10 +559,17 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
             val("разъем cpu") or val("разъемов cpu") or
             val("питания cpu") or val("разъем 8 pin")
         )
-        r["gpuPowerPin"] = _parse_gpu_pin(
-            val("разъем pcie") or val("разъемов pcie") or val("разъем 6+2") or
-            val("12vhpwr") or val("разъем 16")
+        gpu_pin_raw = (
+                val("питание видеокарты") or
+                val("разъем pcie") or
+                val("разъемов pcie") or
+                val("разъем 6+2") or
+                val("12vhpwr") or
+                val("разъем 16") or
+                val("разъемы")  # fallback — если вдруг в общей строке
         )
+
+        r["gpuPowerPin"] = _parse_gpu_pin(gpu_pin_raw)
 
     elif category == "Корпуса":
         case_ff_raw = (val("форм-фактор совместимых") or
