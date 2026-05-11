@@ -1,7 +1,44 @@
-venv/
-__pycache__/
-*.json
-*.log
+# === Секретные данные и конфиги ===
 .env
+*.env
+.env.local
+secrets.json
+
+# === Виртуальное окружение ===
+# (Чтобы не заливать гигабайты библиотек)
+venv/
+.venv/
+env/
+ENV/
+bin/
+lib/
+include/
+
+# === Кэш Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# === Настройки редакторов (IDE) ===
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# === Логи и временные файлы ===
+*.log
+logs/
+tmp/
+temp/
+
+# === Базы данных ===
+*.sqlite3
+*.db
+*.sql
+
+# === Специфичное для ОС ===
+.DS_Store
+Thumbs.db

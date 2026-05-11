@@ -2,8 +2,13 @@ import time
 import json
 import os
 import re
+import random
 import logging
 from DrissionPage import ChromiumPage, ChromiumOptions
+from database import DB_CONFIG
+import psycopg2
+from psycopg2.extras import Json
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,62 +17,84 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ───────────────────── конфиг для слабого VPS ─────────────────────
-PAGES_LIMIT        = 20   # максимум страниц на категорию
-PRODUCTS_PER_PAGE  = 36   # уменьшили с 36 — меньше нагрузка на RAM
-BATCH_SIZE         = 2    # было 4 — на 1GB RAM больше нельзя
-SCROLL_STEPS       = 1    # было 2 — экономим время
-SCROLL_PAUSE       = 0.2  # было 0.3
-PAGE_LOAD_PAUSE    = 1.2  # было 1.5
-BATCH_LOAD_PAUSE   = 1.0  # пауза после открытия пачки вкладок
-# ──────────────────────────────────────────────────────────────────
+# ───────────────────────── конфиг для i3-12100f / 32GB ─────────────────────────
+PAGES_LIMIT       = None   # максимум страниц на категорию
+PRODUCTS_PER_PAGE = None   # товаров со страницы
+BATCH_SIZE        = 6    # вкладок одновременно — 32GB тянет спокойно
+SCROLL_STEPS      = 2    # прокруток для lazy-load
+SCROLL_PAUSE      = 0.25 # пауза между прокрутками
+PAGE_LOAD_PAUSE   = 1.2  # пауза после загрузки страницы каталога
+BATCH_LOAD_PAUSE  = 1.5  # пауза после открытия всех вкладок батча
+
+# Антибан — диапазон случайных задержек между страницами
+PAGE_DELAY_MIN = 1.0
+PAGE_DELAY_MAX = 2.5
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+# Пул User-Agent'ов — каждый запрос выглядит как разный браузер
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
 
 
 def _make_options(load_images: bool = True) -> ChromiumOptions:
     co = ChromiumOptions()
     co.auto_port()
+    # Настройки для второго монитора слева:
+    # Ширина твоего монитора 1680. Смещение по X будет -1680.
+    screen_width = 1680
+    screen_height = 1050
+    offset_x = -1680
+    offset_y = 0
 
-    co.set_argument('--headless')
+    # Устанавливаем позицию и размер при старте
+    co.set_argument(f'--window-size={screen_width},{screen_height}')
+    co.set_argument(f'--window-position={offset_x},{offset_y}')
+
+    # Чтобы окно гарантированно заполнило экран
+    co.set_argument('--start-maximized')
+
+    # Случайный User-Agent при каждом создании браузера — антибан
+    co.set_argument(f'--user-agent={random.choice(_USER_AGENTS)}')
+
     co.set_argument('--no-sandbox')
+    co.set_argument('--disable-blink-features=AutomationControlled')
     co.set_argument('--disable-gpu')
     co.set_argument('--disable-dev-shm-usage')
     co.set_argument('--disable-extensions')
-    co.set_argument('--disable-blink-features=AutomationControlled')
     co.set_argument('--page-load-strategy=eager')
 
-    # ── критично для экономии RAM на слабом VPS ──
-    co.set_argument('--disable-background-networking')
-    co.set_argument('--disable-default-apps')
-    co.set_argument('--disable-sync')
-    co.set_argument('--no-first-run')
-    co.set_argument('--disable-translate')
-    co.set_argument('--hide-scrollbars')
-    co.set_argument('--mute-audio')
-    co.set_argument('--safebrowsing-disable-auto-update')
-    co.set_argument('--js-flags=--max-old-space-size=128')  # лимит JS heap 128MB
-    co.set_argument('--single-process')  # нет fork-процессов — важно для 1 vCPU
+    # На десктопе headless не обязателен — без него Citilink реже блокирует
+    # Если нужно скрыть окно — раскомментируй:
+    # co.set_argument('--headless')
 
     co.mute(True)
     co.incognito(True)
-    co.set_browser_path("/usr/bin/chromium-browser")
+
+    # Путь к Chrome на Windows — поменяй если у тебя другой путь
+    co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 
     # Картинки
     img_policy = 1 if load_images else 2
     co.set_pref("profile.managed_default_content_settings.images", img_policy)
 
-    # Если картинки не нужны — блокируем всё лишнее
     if not load_images:
-        co.set_pref("profile.managed_default_content_settings.plugins", 2)
-        co.set_pref("profile.managed_default_content_settings.popups", 2)
-        co.set_pref("profile.managed_default_content_settings.geolocation", 2)
+        # Блокируем лишнее только когда картинки не нужны
+        co.set_pref("profile.managed_default_content_settings.plugins",       2)
+        co.set_pref("profile.managed_default_content_settings.popups",        2)
+        co.set_pref("profile.managed_default_content_settings.geolocation",   2)
         co.set_pref("profile.managed_default_content_settings.notifications", 2)
-        co.set_pref("profile.managed_default_content_settings.media_stream", 2)
+        co.set_pref("profile.managed_default_content_settings.media_stream",  2)
 
     return co
 
 
 def _safe_quit(page: ChromiumPage) -> None:
-    """Закрывает браузер не бросая исключений."""
     try:
         page.quit()
     except Exception:
@@ -82,53 +109,73 @@ def _is_alive(page: ChromiumPage) -> bool:
         return False
 
 
-# ─────────────────── сбор каталога ───────────────────────
+# ─────────────────── главная точка входа ─────────────────────────────────────
 
 def scrape_citilink(url: str, category_name: str) -> list[dict]:
     """
-    Проходит по страницам каталога, собирает базовую инфу + фото,
-    затем батчами открывает страницы товаров для характеристик и цены.
+    Две фазы:
+    1. Каталог (с картинками) — один браузер собирает name + url + image
+    2. Страницы товаров (без картинок) — батчами по BATCH_SIZE вкладок
     """
-    all_results: list[dict] = []
+    log.info("[%s] Старт → %s", category_name, url)
 
-    # ── Фаза 1: каталог — нужны картинки, один браузер на все страницы ──
-    log.info("[%s] Фаза 1: сбор каталога → %s", category_name, url)
+    # Фаза 1
     product_data = _collect_catalog(url, category_name)
-    log.info("[%s] Каталог собран: %d товаров", category_name, len(product_data))
-
     if not product_data:
-        return all_results
+        log.warning("[%s] Каталог пуст", category_name)
+        return []
 
-    # ── Фаза 2: детали товаров — без картинок, батчами ──
-    log.info("[%s] Фаза 2: сбор характеристик...", category_name)
+    log.info("[%s] Фаза 2: характеристики %d товаров...", category_name, len(product_data))
+
+    # Фаза 2
+    all_results: list[dict] = []
     for batch_start in range(0, len(product_data), BATCH_SIZE):
         batch = product_data[batch_start: batch_start + BATCH_SIZE]
         batch_results = _process_batch(batch, category_name)
         all_results.extend(batch_results)
-        time.sleep(1.0)  # пауза между батчами — даём RAM восстановиться
+
+        # Антибан — случайная пауза между батчами
+        if batch_start + BATCH_SIZE < len(product_data):
+            time.sleep(random.uniform(0.8, 2.0))
 
     log.info("[%s] Готово. Итого: %d товаров", category_name, len(all_results))
     return all_results
 
 
+# ─────────────────── фаза 1: сбор каталога ───────────────────────────────────
+
+import random  # Не забудь добавить импорт в начало файла
+
+
 def _collect_catalog(url: str, category_name: str) -> list[dict]:
     """
-    Фаза 1: проходим страницы каталога с картинками.
-    Один браузер живёт на все страницы категории.
+    Обходит страницы каталога, собирает name + url + image.
+    Один браузер живёт на всё время — экономим на запуске Chrome.
     """
     product_data: list[dict] = []
+    # Набор имен товаров с предыдущей страницы для детекции дублей
+    last_page_product_names = set()
+
     co = _make_options(load_images=True)
     page = ChromiumPage(co)
 
     try:
-        for current_page in range(1, PAGES_LIMIT + 1):
-            target_url = url if current_page == 1 else f"{url.rstrip('/')}/?p={current_page}"
+        current_page = 1
+        # Используем while True, чтобы PAGES_LIMIT = None означал бесконечный обход до конца
+        while True:
+            # Если лимит задан и мы его превысили — выходим
+            if PAGES_LIMIT is not None and current_page > PAGES_LIMIT:
+                break
+
+            target_url = (
+                url if current_page == 1
+                else f"{url.rstrip('/')}/?p={current_page}"
+            )
 
             if not _is_alive(page):
-                log.warning("[%s] Сессия разорвана, переподключение...", category_name)
+                log.warning("[%s] Сессия умерла, переподключение...", category_name)
                 _safe_quit(page)
-                co = _make_options(load_images=True)
-                page = ChromiumPage(co)
+                page = ChromiumPage(_make_options(load_images=True))
 
             try:
                 page.get(target_url)
@@ -137,9 +184,13 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
                 log.error("[%s] Не удалось загрузить %s: %s", category_name, target_url, e)
                 break
 
+            # Переключаем в подробный режим на первой странице
             if current_page == 1:
                 try:
-                    label = page.ele('css:label[for="Подробный режим каталога-list"]', timeout=4)
+                    label = page.ele(
+                        'css:label[for="Подробный режим каталога-list"]',
+                        timeout=4
+                    )
                     if label:
                         label.click()
                         time.sleep(1.5)
@@ -148,20 +199,24 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
 
             log.info("[%s] Страница %d", category_name, current_page)
 
+            # Прокрутка для lazy-load
             for _ in range(SCROLL_STEPS):
                 page.scroll.down(900)
                 time.sleep(SCROLL_PAUSE)
 
+            # Собираем карточки
             items = (
-                page.eles('css:[data-meta-name="SnippetProductHorizontalLayout"]')
-                or page.eles('css:[data-meta-product-id]')
+                    page.eles('css:[data-meta-name="SnippetProductHorizontalLayout"]')
+                    or page.eles('css:[data-meta-product-id]')
             )
 
             if not items:
-                log.info("[%s] Товары на стр.%d не найдены — конец каталога.", category_name, current_page)
+                log.info("[%s] Стр.%d — товаров нет, конец каталога.", category_name, current_page)
                 break
 
             page_products: list[dict] = []
+            current_page_names = set()  # Для проверки дубликатов страниц
+
             for item in items:
                 try:
                     title_el = item.ele('css:[data-meta-name="Snippet__title"]', timeout=1)
@@ -170,18 +225,23 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
 
                     href = title_el.attr("href") or ""
                     name = (title_el.text or "").strip()
+
                     if not href or not name or len(name) < 5:
                         continue
 
-                    full_url = href if href.startswith("http") else f"https://www.citilink.ru{href}"
+                    # Добавляем имя в набор текущей страницы
+                    current_page_names.add(name)
+
+                    full_url = (
+                        href if href.startswith("http")
+                        else f"https://www.citilink.ru{href}"
+                    )
                     if not full_url.endswith('/properties/'):
                         full_url = full_url.rstrip('/') + '/properties/'
 
-                    # Картинка — берём ЗДЕСЬ пока браузер с картинками открыт
                     image_url = ""
                     img_el = item.ele("css:img", timeout=0.3)
                     if img_el:
-                        # Пробуем data-src (lazy-load) потом обычный src
                         src = img_el.attr("data-src") or img_el.attr("src") or ""
                         if src.startswith("//"):
                             image_url = "https:" + src
@@ -190,18 +250,36 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
                         else:
                             image_url = src
 
-                    page_products.append({"name": name, "url": full_url, "image": image_url})
+                    page_products.append({
+                        "name": name,
+                        "url": full_url,
+                        "image": image_url
+                    })
                 except Exception:
                     pass
+
+            # ПРОВЕРКА НА ДУБЛИКАТЫ СТРАНИЦЫ
+            # Если набор имен полностью совпадает с предыдущей страницей — мы зациклились
+            if current_page > 1 and current_page_names == last_page_product_names:
+                log.info("[%s] Контент страницы %d совпадает с %d. Это конец списка.",
+                         category_name, current_page, current_page - 1)
+                break
+
+            # Обновляем "память" парсера
+            last_page_product_names = current_page_names
 
             if PRODUCTS_PER_PAGE:
                 page_products = page_products[:PRODUCTS_PER_PAGE]
 
             product_data.extend(page_products)
-            log.info("[%s] Стр.%d — %d товаров (итого: %d)",
-                     category_name, current_page, len(page_products), len(product_data))
+            log.info(
+                "[%s] Стр.%d — %d товаров (итого: %d)",
+                category_name, current_page,
+                len(page_products), len(product_data)
+            )
 
-            time.sleep(1.0)
+            current_page += 1  # Идем на следующую страницу
+            time.sleep(random.uniform(PAGE_DELAY_MIN, PAGE_DELAY_MAX))
 
     except Exception as e:
         log.error("[%s] Критическая ошибка каталога: %s", category_name, e)
@@ -211,35 +289,38 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
     return product_data
 
 
-# ─────────────── обработка пачки вкладок ─────────────────
+# ─────────────────── фаза 2: батч страниц товаров ────────────────────────────
 
 def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
     """
-    Фаза 2: открывает BATCH_SIZE вкладок БЕЗ картинок,
-    собирает цену и характеристики.
+    Открывает BATCH_SIZE вкладок без картинок,
+    параллельно ждёт загрузки, потом последовательно собирает данные.
     """
-    co = _make_options(load_images=False)  # картинки на стр. товара не нужны
+    co      = _make_options(load_images=False)
     results: list[dict] = []
-    page = ChromiumPage(co)
+    page    = ChromiumPage(co)
+    tabs:   list[dict] = []
 
-    tabs: list[dict] = []
     try:
+        # Открываем все вкладки разом — они грузятся параллельно
         for p in product_data:
             try:
                 tab = page.new_tab(p["url"])
                 tabs.append({"tab": tab, "product": p})
             except Exception as e:
-                log.debug("Не удалось открыть вкладку %s: %s", p["url"], e)
+                log.debug("Вкладка не открылась %s: %s", p["url"], e)
 
+        # Ждём пока все вкладки загрузятся (eager — ждём DOM, не картинки)
         time.sleep(BATCH_LOAD_PAUSE)
 
+        # Собираем данные последовательно
         for entry in tabs:
-            tab = entry["tab"]
+            tab     = entry["tab"]
             product = entry["product"]
             try:
-                specs = _collect_specs(tab)
+                specs      = _collect_specs(tab)
                 price_text = _collect_price(tab)
-                extracted = _extract_logic(category_name, product["name"], specs)
+                extracted  = _extract_logic(category_name, product["name"], specs)
 
                 results.append({
                     "id":            abs(hash(product["name"] + category_name)) % (10 ** 9),
@@ -247,14 +328,14 @@ def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
                     "category":      category_name,
                     "priceCitilink": price_text,
                     "priceDNS":      "---",
-                    "imageUrl":      product["image"],  # пришло из фазы 1
+                    "imageUrl":      product["image"],
                     "productUrl":    product["url"],
                     **extracted,
                     "specs":         specs,
                 })
                 log.info("  ✓ %s", product["name"][:55])
             except Exception as e:
-                log.debug("Ошибка обработки %s: %s", product["name"][:40], e)
+                log.debug("Ошибка %s: %s", product["name"][:40], e)
             finally:
                 try:
                     tab.close()
@@ -275,7 +356,7 @@ def _collect_specs(tab) -> dict:
         rows = tab.eles('css:[class*="PropertiesItem"]', timeout=3)
         for row in rows:
             try:
-                n = row.ele('css:[class*="PropertiesName"]', timeout=0.1)
+                n = row.ele('css:[class*="PropertiesName"]',  timeout=0.1)
                 v = row.ele('css:[class*="PropertiesValue"]', timeout=0.1)
                 if n and v:
                     key = n.text.strip().rstrip(":")
@@ -302,6 +383,39 @@ def _collect_price(tab) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ИЗВЛЕЧЕНИЕ ХАРАКТЕРИСТИК
+#  socket             — CPU / MB / Cooler
+#  ramType            — CPU / MB / RAM
+#  ramSlots           — MB
+#  ramMaxFreq         — MB
+#  ramHeight          — RAM
+#  ramCapacity        — RAM
+#  tdp                — CPU
+#  maxTdp             — Cooler
+#  coolerHeight       — Cooler
+#  psuWattage         — PSU
+#  psuFormFactor      — PSU
+#  psuLength          — PSU
+#  cpuPowerPin        — PSU / MB
+#  gpuPowerPin        — PSU / GPU
+#  formFactor         — MB / Case / PSU
+#  pciVersion         — MB / GPU
+#  m2Slots            — MB
+#  m2Types            — MB
+#  gpuLength          — GPU
+#  gpuHeight          — GPU
+#  gpuSlots           — GPU
+#  gpuTdp             — GPU
+#  gpuReqPsu          — GPU
+#  gpuPciVersion      — GPU
+#  vram               — GPU
+#  gpuChipset         — GPU
+#  maxGpuLength       — Case
+#  maxCpuCoolerHeight — Case
+#  maxPsuLength       — Case
+#  supportedMbFormats — Case
+#  ssdInterface       — SSD
+#  ssdFormFactor      — SSD
+#  ssdCapacityGb      — SSD
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _empty_compat() -> dict:
@@ -343,8 +457,8 @@ def _empty_compat() -> dict:
 
 
 def _extract_logic(category: str, name: str, specs: dict) -> dict:
-    r = _empty_compat()
-    c = {str(k).strip().lower(): str(v).strip() for k, v in specs.items()}
+    r  = _empty_compat()
+    c  = {str(k).strip().lower(): str(v).strip() for k, v in specs.items()}
     cv = {k: v.lower() for k, v in c.items()}
     full = (name + " " + " ".join(cv.keys()) + " " + " ".join(cv.values())).lower()
 
@@ -381,12 +495,12 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
         m = re.search(r"(\d+)\s*гб", vram_str, re.I)
         r["vram"] = int(m.group(1)) if m else 0
 
-        r["gpuTdp"]    = watt(val("максимальное энергопотребление")) or \
-                          watt(val("энергопотребление")) or \
-                          watt(val("tdp"))
-        r["gpuReqPsu"] = watt(val("рекомендуемая мощность")) or \
-                          watt(val("рекомендовано")) or \
-                          watt(val("питание"))
+        r["gpuTdp"]    = (watt(val("максимальное энергопотребление")) or
+                           watt(val("энергопотребление")) or
+                           watt(val("tdp")))
+        r["gpuReqPsu"] = (watt(val("рекомендуемая мощность")) or
+                           watt(val("рекомендовано")) or
+                           watt(val("питание")))
         if r["gpuReqPsu"] == 0:
             r["gpuReqPsu"] = watt(full)
 
@@ -418,7 +532,9 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
         freq_raw = val("максимальная частота памяти") or val("частота памяти")
         r["ramMaxFreq"] = first_int(freq_raw, 800, 12000)
 
-        r["cpuPowerPin"] = _parse_cpu_pin(val("разъем питания процессора") or val("питание процессора"))
+        r["cpuPowerPin"] = _parse_cpu_pin(
+            val("разъем питания процессора") or val("питание процессора")
+        )
 
         m2_raw = val("количество разъемов m.2") or val("разъемов m.2") or val("m.2")
         r["m2Slots"] = first_int(m2_raw, 0, 8)
@@ -435,12 +551,13 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
         r["ramHeight"] = mm(height_raw) or first_int(height_raw, 20, 80)
 
     elif category == "Блоки питания":
-        r["psuWattage"]  = watt(val("мощность")) or first_int(val("мощность"), 200, 3000)
-        r["formFactor"]  = _find_psu_form_factor(full)
-        r["psuLength"]   = mm(val("глубина")) or mm(val("длина"))
+        r["psuWattage"] = watt(val("мощность")) or first_int(val("мощность"), 200, 3000)
+        r["formFactor"] = _find_psu_form_factor(full)
+        r["psuLength"]  = mm(val("глубина")) or mm(val("длина"))
 
         r["cpuPowerPin"] = _parse_cpu_pin(
-            val("разъем cpu") or val("разъемов cpu") or val("питания cpu") or val("разъем 8 pin")
+            val("разъем cpu") or val("разъемов cpu") or
+            val("питания cpu") or val("разъем 8 pin")
         )
         r["gpuPowerPin"] = _parse_gpu_pin(
             val("разъем pcie") or val("разъемов pcie") or val("разъем 6+2") or
@@ -451,13 +568,12 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
         case_ff_raw = (val("форм-фактор совместимых") or
                        val("типоразмер") or
                        val("форм-фактор"))
-        r["formFactor"]         = _find_form_factor(case_ff_raw)
-
-        r["maxGpuLength"]       = mm(val("длина видеокарты")) or mm(val("макс. длина видеокарты"))
-        r["maxCpuCoolerHeight"] = (mm(val("высота кулера")) or
+        r["formFactor"]        = _find_form_factor(case_ff_raw)
+        r["maxGpuLength"]      = mm(val("длина видеокарты")) or mm(val("макс. длина видеокарты"))
+        r["maxCpuCoolerHeight"]= (mm(val("высота кулера")) or
                                    mm(val("макс. высота кулера")) or
                                    mm(val("высота процессорного кулера")))
-        r["maxPsuLength"]       = mm(val("длина блока питания")) or mm(val("глубина блока питания"))
+        r["maxPsuLength"]      = mm(val("длина блока питания")) or mm(val("глубина блока питания"))
 
         mb_fmt_raw = val("форм-фактор совместимых") or val("совместимые мп") or val("форм-фактор")
         r["supportedMbFormats"] = _find_supported_mb_formats(mb_fmt_raw)
@@ -465,8 +581,9 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
     elif category == "Кулеры":
         compat_raw = val("совместимость") or val("сокет")
         r["socket"]       = _find_all_sockets(compat_raw) if compat_raw else _find_socket(full)
-        r["maxTdp"]       = watt(val("рассеиваемая мощность")) or watt(val("tdp")) or \
-                             first_int(val("tdp"), 30, 500)
+        r["maxTdp"]       = (watt(val("рассеиваемая мощность")) or
+                              watt(val("tdp")) or
+                              first_int(val("tdp"), 30, 500))
         r["coolerHeight"] = mm(val("высота кулера")) or mm(val("высота"))
 
     elif category == "SSD":
@@ -669,10 +786,34 @@ def load_from_file(filename: str = "components.json") -> dict | None:
         return None
 
 
-def save_to_file(data: dict, filename: str = "components.json") -> None:
+def save_to_db(data: dict) -> None:
+    """Заменяет save_to_file. Сохраняет весь спарсенный словарь в PostgreSQL"""
+    conn = None
     try:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        log.info("Сохранено → %s", filename)
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+
+        total_saved = 0
+        for category, products in data.items():
+            for item in products:
+                cur.execute("""
+                    INSERT INTO components (category, name, price, specs)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE 
+                    SET price = EXCLUDED.price, 
+                        specs = EXCLUDED.specs,
+                        last_updated = CURRENT_TIMESTAMP;
+                """, (category, item['name'], item['price'], Json(item['specs'])))
+                total_saved += 1
+
+        conn.commit()
+        cur.close()
+        print(f">>> [✓] Успешно сохранено в БД: {total_saved} позиций")
+
     except Exception as e:
-        log.error("Ошибка сохранения %s: %s", filename, e)
+        if conn:
+            conn.rollback()
+        print(f">>> [!] Ошибка сохранения в PostgreSQL: {e}")
+    finally:
+        if conn:
+            conn.close()
