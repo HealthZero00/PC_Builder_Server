@@ -182,6 +182,65 @@ def _int(val, default: int = 0) -> int:
         return default
 
 
+def _lookup_text(value: object) -> str:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    text = re.sub(r"\bpci\s*-\s*e\b", "pcie", text)
+    text = re.sub(r"\bpci\s+e\b", "pcie", text)
+    return re.sub(r"\s+", " ", text)
+
+
+def _iter_component_specs(component: dict | None):
+    if not component:
+        return
+    for key in ("specs", "specsCitilink", "specsRegard", "specsDNS"):
+        specs = component.get(key)
+        if isinstance(specs, dict):
+            yield from specs.items()
+
+
+def _derive_gpu_pin_from_specs(component: dict | None) -> str:
+    for raw_key, raw_value in _iter_component_specs(component) or ():
+        key = _lookup_text(raw_key)
+        value = str(raw_value or "").strip()
+        value_lookup = _lookup_text(value)
+
+        count = _int(value, 0)
+        if count > 0 and all(part in key for part in ("разъемов", "6+2", "pci")):
+            return f"{count}x(6+2) pin"
+        if count > 0 and all(part in key for part in ("разъемов", "8", "pin", "pci")):
+            return f"{count}x8 pin"
+        if count > 0 and all(part in key for part in ("разъемов", "6", "pin", "pci")):
+            return f"{count}x6 pin"
+
+        if "питание видеокарты" in key and value_lookup not in NO_POWER_MARKERS:
+            return value
+        if key == "разъемы" and "питание видеокарты" in value_lookup:
+            return value
+
+    return ""
+
+
+def _derive_psu_length_from_specs(component: dict | None) -> int:
+    for raw_key, raw_value in _iter_component_specs(component) or ():
+        key = _lookup_text(raw_key)
+        value = str(raw_value or "")
+
+        if "упаков" in key or "кабел" in key or "линий" in key:
+            continue
+
+        numbers = re.findall(r"\d+(?:[.,]\d+)?", value)
+        if not numbers:
+            continue
+
+        if ("размеры" in key or "габариты" in key) and len(numbers) >= 3:
+            return int(float(numbers[2].replace(",", ".")))
+
+        if "глубина" in key or ("длина" in key and "блока питания" in key):
+            return int(float(numbers[0].replace(",", ".")))
+
+    return 0
+
+
 def _normalize_gpu_pin(pin_str: str) -> str:
     """
     Нормализует строку разъёма питания GPU к единому формату.
@@ -221,14 +280,14 @@ def _normalize_gpu_pin(pin_str: str) -> str:
 
     # Формат "Nx(A+B)" → суммируем пины, разворачиваем по количеству
     # Пример: "2x(6+2)" → count=2, a=6, b=2 → total_per=8 → "8+8 pin"
-    m = re.match(r'(\d+)\s*[x×*]\s*\((\d+)\+(\d+)\)', s)
+    m = re.match(r'(\d+)\s*[xх×*]\s*\((\d+)\+(\d+)\)', s)
     if m:
         count     = int(m.group(1))
         total_per = int(m.group(2)) + int(m.group(3))
         return "+".join([str(total_per)] * count) + " pin"
 
     # Формат "Nx(A)" → "A+A+... pin"
-    m = re.match(r'(\d+)\s*[x×*]\s*\((\d+)\)', s)
+    m = re.match(r'(\d+)\s*[xх×*]\s*\((\d+)\)', s)
     if m:
         count = int(m.group(1))
         a     = int(m.group(2))
@@ -236,7 +295,7 @@ def _normalize_gpu_pin(pin_str: str) -> str:
 
     # Формат "NxA" без скобок → "A+A+... pin"
     # Пример: "2x8" → "8+8 pin", "3x6" → "6+6+6 pin"
-    m = re.match(r'(\d+)\s*[x×*]\s*(\d+)', s)
+    m = re.match(r'(\d+)\s*[xх×*]\s*(\d+)', s)
     if m:
         count = int(m.group(1))
         a     = int(m.group(2))
@@ -283,14 +342,11 @@ def _gpu_pin_units(pin_str: str) -> int:
     if "12vhpwr" in low:
         return 8
 
-    # Суммируем все числа в строке
-    # "8+8 pin" → [8, 8] → sum=16 → units = 16//8 = 2
+    # Считаем количество разъёмов после нормализации:
+    # "8+8 pin" → [8, 8] → 2 разъёма, "6+2 pin" → "8 pin" → 1 разъём.
     numbers = re.findall(r'\d+', low.replace("pin", ""))
     if numbers:
-        total_pins = sum(int(n) for n in numbers)
-        # Каждые 8 пинов = 1 единица (8-pin = ~150 Вт, 6-pin = ~75 Вт)
-        # Используем 6 как делитель для гибкости (6-pin и 8-pin оба считаются)
-        return max(1, total_pins // 6)
+        return len(numbers)
 
     return 0
 
@@ -691,100 +747,168 @@ class BuildValidator:
                     ),
                     field="psu"
                 ))
+        import re
+
+        def parse_pcie_pins(pin_string: str) -> dict:
+            """
+            Преобразует строку разъемов в словарь с их количеством.
+            Поддерживает префиксы (2x8 pin) и постфиксы (6+2 pin x2, 12VHPWR x1).
+            """
+            result = {'16pin': 0, '8pin': 0, '6pin': 0}
+            if not pin_string or not isinstance(pin_string, str) or pin_string.strip() in ('', '---', 'Нет', 'без питания'):
+                return result
+
+            s = pin_string.lower()
+
+            # --- 1. Обработка 16-pin / 12VHPWR ---
+            # Префикс: 2x16 pin, 1x12vhpwr
+            for m in re.finditer(r'(\d+)\s*[x×х]\s*(?:16|12vhpwr)', s):
+                result['16pin'] += int(m.group(1))
+                s = s.replace(m.group(0), '')
+            # Постфикс: 16 pin x2, 12vhpwr x1
+            for m in re.finditer(r'(?:16|12vhpwr)\s*(?:pin|пин|пинов|-pin)?\s*[x×х]\s*(\d+)', s):
+                result['16pin'] += int(m.group(1))
+                s = s.replace(m.group(0), '')
+            # Одиночные (без множителя)
+            count_16 = len(re.findall(r'(?:16\b|12vhpwr)', s))
+            result['16pin'] += count_16
+            s = re.sub(r'(?:16|12vhpwr)\s*(?:pin|пин|пинов|-pin)?', '', s)
+
+            # --- 2. Обработка 8-pin и (6+2)-pin ---
+            # Префикс: 2x8 pin, 3x(6+2)
+            for m in re.finditer(r'(\d+)\s*[x×х]\s*\(?(?:8|6\s*\+\s*2)\)?', s):
+                result['8pin'] += int(m.group(1))
+                s = s.replace(m.group(0), '')
+            # Постфикс: 8 pin x2, (6+2) pin x4
+            for m in re.finditer(r'\(?(?:8|6\s*\+\s*2)\)?\s*(?:pin|пин|пинов|-pin)?\s*[x×х]\s*(\d+)', s):
+                result['8pin'] += int(m.group(1))
+                s = s.replace(m.group(0), '')
+
+            # --- 3. Обработка 6-pin ---
+            # Префикс: 2x6 pin
+            for m in re.finditer(r'(\d+)\s*[x×х]\s*\(?6\)?(?![\s\+]*2)', s):
+                result['6pin'] += int(m.group(1))
+                s = s.replace(m.group(0), '')
+            # Постфикс: 6 pin x2
+            for m in re.finditer(r'\(?6\)?\s*(?:pin|пин|пинов|-pin)?\s*[x×х]\s*(\d+)', s):
+                result['6pin'] += int(m.group(1))
+                s = s.replace(m.group(0), '')
+
+            # --- 4. Одиночные вхождения (если написано просто "6+2 pin, 8 pin") ---
+            count_6_2 = len(re.findall(r'6\s*\+\s*2', s))
+            result['8pin'] += count_6_2
+            s = re.sub(r'6\s*\+\s*2', '', s)
+
+            count_8 = len(re.findall(r'\b8\b', s))
+            result['8pin'] += count_8
+
+            count_6 = len(re.findall(r'\b6\b', s))
+            result['6pin'] += count_6
+
+            return result
 
         # ── Питание GPU — ИСПРАВЛЕНО: нормализация форматов ──────────────
+        # ── Питание GPU — ИСПРАВЛЕНО: нормализация форматов ──────────────
         for gpu in self.gpus:
-            gpu_pin     = _g(gpu,      "gpuPowerPin", "") or ""
+            gpu_pin = _g(gpu, "gpuPowerPin", "") or ""
             psu_gpu_pin = _g(self.psu, "gpuPowerPin", "") or ""
-
-            # Нормализуем строки (2x(6+2) → 8+8 pin и т.д.)
-            gpu_pin_norm = _normalize_gpu_pin(gpu_pin)
-            psu_pin_norm = _normalize_gpu_pin(psu_gpu_pin)
-
-            gpu_pin_low = gpu_pin_norm.lower().strip()
-            psu_pin_low = psu_pin_norm.lower().strip()
+            if psu_gpu_pin.lower().strip() in NO_POWER_MARKERS:
+                psu_gpu_pin_from_specs = _derive_gpu_pin_from_specs(self.psu)
+                if psu_gpu_pin_from_specs:
+                    psu_gpu_pin = psu_gpu_pin_from_specs
 
             # GPU требует доп. питание?
             gpu_needs_power = (
-                gpu_pin.lower().strip() not in NO_POWER_MARKERS
-                and gpu_pin_low not in NO_POWER_MARKERS
-                and bool(gpu_pin.strip())
-            )
-
-            # У БП есть разъёмы для GPU?
-            psu_has_gpu_pin = (
-                psu_gpu_pin.lower().strip() not in NO_POWER_MARKERS
-                and psu_pin_low not in NO_POWER_MARKERS
-                and _gpu_pin_units(psu_pin_norm) > 0
-            )
-
-            log.debug(
-                "GPU pin: '%s' → '%s' | PSU pin: '%s' → '%s' | "
-                "needs=%s has=%s",
-                gpu_pin, gpu_pin_norm,
-                psu_gpu_pin, psu_pin_norm,
-                gpu_needs_power, psu_has_gpu_pin
+                    gpu_pin.lower().strip() not in NO_POWER_MARKERS
+                    and bool(gpu_pin.strip())
             )
 
             if gpu_needs_power:
-                if "12vhpwr" in gpu_pin_low:
-                    # 12VHPWR — специальный случай
-                    if not psu_has_gpu_pin or "12vhpwr" not in psu_pin_low:
-                        self.result.warning.append(Issue(
-                            code="GPU_12VHPWR_ADAPTER",
-                            title="Видеокарта требует 12VHPWR, БП не имеет нативного разъёма",
-                            detail=(
-                                "GPU использует разъём 12VHPWR (16 pin). "
-                                "Потребуется переходник 4×8-pin→16-pin. "
-                                "Используйте только сертифицированные кабели."
-                            ),
-                            field="gpu/psu"
-                        ))
+                # ВОТ ЗДЕСЬ вызываем нашу новую функцию-парсер
+                gpu_pins = parse_pcie_pins(gpu_pin)
+                psu_pins = parse_pcie_pins(psu_gpu_pin)
+
+                log.debug(
+                    f"GPU разъемы: {gpu_pins} (из строки '{gpu_pin}') | "
+                    f"PSU разъемы: {psu_pins} (из строки '{psu_gpu_pin}')"
+                )
+
+                # 1. Проверка 16-pin (12VHPWR)
+                if gpu_pins['16pin'] > 0:
+                    missing_16 = gpu_pins['16pin'] - psu_pins['16pin']
+                    if missing_16 > 0:
+                        # 16-pin у БП нет, проверяем возможность подключения через переходник (нужно 3x 8-pin)
+                        needed_8pin_for_adapter = missing_16 * 3
+                        available_8pin = psu_pins['8pin'] - gpu_pins['8pin']
+
+                        if available_8pin >= needed_8pin_for_adapter:
+                            # Хватает кабелей для переходника, "резервируем" их, вычитая из доступных
+                            psu_pins['8pin'] -= needed_8pin_for_adapter
+                            self.result.warning.append(Issue(
+                                code="GPU_12VHPWR_ADAPTER",
+                                title="Видеокарта требует 12VHPWR, БП не имеет нативного разъёма",
+                                detail=(
+                                    f"GPU использует разъём 12VHPWR ({gpu_pin}). "
+                                    f"У БП его нет, поэтому потребуется комплектный переходник с 8-pin кабелей "
+                                    f"(используются 3 шт. 8-pin). Используйте только сертифицированные кабели."
+                                ),
+                                field="gpu/psu"
+                            ))
+                        else:
+                            self.result.critical.append(Issue(
+                                code="GPU_POWER_MISSING",
+                                title="БП не имеет разъёмов питания для GPU (12VHPWR)",
+                                detail=(
+                                    f"Видеокарте нужен {gpu_pin}. У БП нет нативного кабеля 12VHPWR, "
+                                    f"и недостаточно свободных 8-pin (6+2) кабелей для подключения через переходник "
+                                    f"(указано: '{psu_gpu_pin}')."
+                                ),
+                                field="psu"
+                            ))
                     else:
+                        # 12VHPWR есть у БП нативно
                         self.result.advisory.append(Issue(
                             code="GPU_12VHPWR_REMINDER",
                             title="12VHPWR: соблюдайте правила укладки кабеля",
                             detail=(
                                 "Не сгибайте кабель под углом > 90° "
-                                "ближе 35 мм от разъёма (риск оплавления на RTX 40xx)."
+                                "ближе 35 мм от разъёма (риск оплавления коннектора)."
                             ),
                             field="gpu"
                         ))
-                else:
-                    if not psu_has_gpu_pin:
-                        # БП вообще не имеет разъёмов GPU
-                        self.result.critical.append(Issue(
-                            code="GPU_POWER_MISSING",
-                            title="БП не имеет разъёмов питания для GPU",
-                            detail=(
-                                f"Видеокарте нужен {gpu_pin}, "
-                                f"но у выбранного БП нет разъёмов питания GPU "
-                                f"(указано: '{psu_gpu_pin}'). "
-                                f"Замените БП на модель с PCIe 6-pin / 8-pin кабелями."
-                            ),
-                            field="psu"
-                        ))
-                    else:
-                        # Проверяем достаточность мощности разъёмов
-                        gpu_units = _gpu_pin_units(gpu_pin_norm)
-                        psu_units = _gpu_pin_units(psu_pin_norm)
 
-                        if gpu_units > 0 and psu_units > 0 and psu_units < gpu_units:
-                            self.result.critical.append(Issue(
-                                code="GPU_POWER_PIN_INSUFFICIENT",
-                                title="БП не имеет достаточного числа разъёмов для GPU",
-                                detail=(
-                                    f"GPU требует {gpu_pin} "
-                                    f"(≈{gpu_units * 75} Вт через разъёмы), "
-                                    f"БП предоставляет {psu_gpu_pin} "
-                                    f"(≈{psu_units * 75} Вт). "
-                                    f"Выберите БП с нужными PCIe кабелями."
-                                ),
-                                field="gpu/psu"
-                            ))
-                        # Если units совпадают или psu_units > gpu_units — всё ок
+                # 2. Проверка 8-pin (6+2 pin)
+                missing_8 = gpu_pins['8pin'] - psu_pins['8pin']
+                if missing_8 > 0:
+                    self.result.critical.append(Issue(
+                        code="GPU_POWER_PIN_INSUFFICIENT",
+                        title="Блоку питания не хватает разъемов 8-pin (6+2)",
+                        detail=(
+                            f"GPU требует {gpu_pins['8pin']}x 8-pin (с учетом переходников 12VHPWR, если они нужны), "
+                            f"а БП предоставляет только {psu_pins['8pin']}x 8-pin (указано: '{psu_gpu_pin}')."
+                        ),
+                        field="gpu/psu"
+                    ))
+
+                # 3. Проверка 6-pin
+                missing_6 = gpu_pins['6pin'] - psu_pins['6pin']
+                if missing_6 > 0:
+                    # Оставшиеся 8-pin (6+2) кабели от БП можно использовать как 6-pin
+                    available_8_for_6 = psu_pins['8pin'] - gpu_pins['8pin']
+                    if available_8_for_6 < missing_6:
+                        self.result.critical.append(Issue(
+                            code="GPU_POWER_PIN_INSUFFICIENT",
+                            title="Блоку питания не хватает разъемов 6-pin",
+                            detail=(
+                                f"GPU требует {gpu_pins['6pin']}x 6-pin. У БП недостаточно 6-pin коннекторов, "
+                                f"и свободных комбинированных 6+2-pin для их замены тоже нет."
+                            ),
+                            field="gpu/psu"
+                        ))
+
             else:
                 # GPU питается от слота PCIe (≤75 Вт, без доп. разъёма)
+                # _int — это, видимо, твоя внутренняя функция приведения типов
                 gpu_tdp_single = _int(_g(gpu, "gpuTdp"), 0)
                 if gpu_tdp_single > 0:
                     self.result.advisory.append(Issue(
@@ -1036,6 +1160,13 @@ class BuildValidator:
 
         psu_len      = _int(_g(self.psu,  "psuLength"), 0)
         case_psu_max = _int(_g(self.case, "maxPsuLength"), 0)
+        derived_psu_len = _derive_psu_length_from_specs(self.psu)
+        if derived_psu_len and (
+            not psu_len
+            or psu_len > 250
+            or (case_psu_max and psu_len > case_psu_max and derived_psu_len <= case_psu_max)
+        ):
+            psu_len = derived_psu_len
 
         if case_ff == "Mini-ITX" and psu_ff == "ATX":
             self.result.critical.append(Issue(

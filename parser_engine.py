@@ -526,6 +526,22 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
         m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:мм|mm)", text, re.I)
         return int(float(m.group(1).replace(",", "."))) if m else 0
 
+    def dimensions_depth_mm(text: str) -> int:
+        numbers = re.findall(r"\d+(?:[.,]\d+)?", text or "")
+        if len(numbers) < 3:
+            return 0
+        return int(float(numbers[2].replace(",", ".")))
+
+    def val_dimensions(*key_fragments: str) -> str:
+        key_fragments = tuple(fragment.replace("ё", "е") for fragment in key_fragments)
+        for k, v in cv.items():
+            norm_key = k.replace("ё", "е")
+            if "упаков" in norm_key:
+                continue
+            if all(fragment in norm_key for fragment in key_fragments):
+                return v
+        return ""
+
     def watt(text: str) -> int:
         m = re.search(r"(\d{2,4})\s*(?:вт|w)\b", text, re.I)
         return int(m.group(1)) if m else 0
@@ -640,7 +656,13 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
         r["psuWattage"] = watt(val("мощность")) or first_int(val("мощность"), 200, 3000)
         r["psuFormFactor"] = _find_psu_form_factor(full)
         r["formFactor"] = r["psuFormFactor"]
-        r["psuLength"]  = mm(val("глубина")) or mm(val("длина"))
+        r["psuLength"]  = (
+            mm(val_all("глубина", "блока питания")) or
+            mm(val_all("длина", "блока питания")) or
+            dimensions_depth_mm(val_dimensions("размеры", "шхвхг")) or
+            dimensions_depth_mm(val_dimensions("габариты", "шхвхг")) or
+            mm(val("глубина"))
+        )
         r["psuEfficiency"] = _find_psu_efficiency(full)
 
         r["cpuPowerPin"] = _parse_cpu_pin(
