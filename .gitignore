@@ -34,6 +34,10 @@ logs/
 tmp/
 temp/
 
+# === Служебные файлы парсеров ===
+.camoufox_dns_profile/
+dns_debug/
+
 # === Базы данных ===
 *.sqlite3
 *.db

@@ -1,14 +1,19 @@
-import time
+"""
+© Жиляков Д.Э., 2026. Все права защищены.
+"""
+
+"""
+parser_engine.py — парсер Citilink.
+p.
+"""
+
+import asyncio
 import json
 import os
 import re
 import random
 import logging
-from DrissionPage import ChromiumPage, ChromiumOptions
-from database import DB_CONFIG
-import psycopg2
-from psycopg2.extras import Json
-
+from camoufox.async_api import AsyncCamoufox
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,153 +22,173 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ───────────────────────── конфиг для i3-12100f / 32GB ─────────────────────────
-PAGES_LIMIT       = None   # максимум страниц на категорию
-PRODUCTS_PER_PAGE = None   # товаров со страницы
-BATCH_SIZE        = 6    # вкладок одновременно — 32GB тянет спокойно
-SCROLL_STEPS      = 2    # прокруток для lazy-load
-SCROLL_PAUSE      = 0.25 # пауза между прокрутками
-PAGE_LOAD_PAUSE   = 1.2  # пауза после загрузки страницы каталога
-BATCH_LOAD_PAUSE  = 1.5  # пауза после открытия всех вкладок батча
-
-# Антибан — диапазон случайных задержек между страницами
-PAGE_DELAY_MIN = 1.0
-PAGE_DELAY_MAX = 2.5
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────────────────────── конфиг ─────────────────────────
+PAGES_LIMIT       = 1
+PRODUCTS_PER_PAGE = 3
+BATCH_SIZE        = 6
+SCROLL_STEPS      = 2
+SCROLL_PAUSE      = 0.25
+PAGE_LOAD_PAUSE   = 1.2
+BATCH_LOAD_PAUSE  = 1.5
+PAGE_DELAY_MIN    = 1.0
+PAGE_DELAY_MAX    = 2.5
+# ──────────────────────────────────────────────────────────
 
 
-# Пул User-Agent'ов — каждый запрос выглядит как разный браузер
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
+# ═══════════════════════ утилиты ═════════════════════════
+
+def _make_browser(block_images: bool = False, headless: bool = True) -> AsyncCamoufox:
+    """Создаёт контекст AsyncCamoufox (используется как async context manager)."""
+    return AsyncCamoufox(
+        headless=headless,
+        os="windows",
+        humanize=True,
+        block_images=block_images,
+
+    )
 
 
-def _make_options(load_images: bool = True) -> ChromiumOptions:
-    co = ChromiumOptions()
-    co.auto_port()
-    # Настройки для второго монитора слева:
-    # Ширина твоего монитора 1680. Смещение по X будет -1680.
-    screen_width = 1680
-    screen_height = 1050
-    offset_x = -1680
-    offset_y = 0
-
-    # Устанавливаем позицию и размер при старте
-    co.set_argument(f'--window-size={screen_width},{screen_height}')
-    co.set_argument(f'--window-position={offset_x},{offset_y}')
-
-    # Чтобы окно гарантированно заполнило экран
-    co.set_argument('--start-maximized')
-
-    # Случайный User-Agent при каждом создании браузера — антибан
-    co.set_argument(f'--user-agent={random.choice(_USER_AGENTS)}')
-
-    co.set_argument('--no-sandbox')
-    co.set_argument('--disable-blink-features=AutomationControlled')
-    co.set_argument('--disable-gpu')
-    co.set_argument('--disable-dev-shm-usage')
-    co.set_argument('--disable-extensions')
-    co.set_argument('--page-load-strategy=eager')
-
-    # На десктопе headless не обязателен — без него Citilink реже блокирует
-    # Если нужно скрыть окно — раскомментируй:
-    # co.set_argument('--headless')
-
-    co.mute(True)
-    co.incognito(True)
-
-    # Путь к Chrome на Windows — поменяй если у тебя другой путь
-    co.set_browser_path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-
-    # Картинки
-    img_policy = 1 if load_images else 2
-    co.set_pref("profile.managed_default_content_settings.images", img_policy)
-
-    if not load_images:
-        # Блокируем лишнее только когда картинки не нужны
-        co.set_pref("profile.managed_default_content_settings.plugins",       2)
-        co.set_pref("profile.managed_default_content_settings.popups",        2)
-        co.set_pref("profile.managed_default_content_settings.geolocation",   2)
-        co.set_pref("profile.managed_default_content_settings.notifications", 2)
-        co.set_pref("profile.managed_default_content_settings.media_stream",  2)
-
-    return co
-
-
-def _safe_quit(page: ChromiumPage) -> None:
+async def _close_browser_safe(browser, category_name: str) -> None:
+    """
+    Безопасное закрытие браузера.
+    Игнорирует 'Connection closed' — баг Node.js 24 + Playwright/Firefox.
+    """
     try:
-        page.quit()
+        await browser.close()
+    except Exception as e:
+        err = str(e)
+        if "Connection closed" in err or "Browser.close" in err:
+            log.debug(
+                "[%s] Браузер закрылся с ожидаемой ошибкой Node.js 24: %s",
+                category_name, err
+            )
+        else:
+            log.warning(
+                "[%s] Неожиданная ошибка закрытия браузера: %s",
+                category_name, e
+            )
+
+
+async def _scroll_page(page) -> None:
+    """
+    Прокрутка через mouse.wheel вместо page.evaluate('window.scrollBy...').
+    Не использует JS-bridge — не падает при проблемах с драйвером на Node.js 24.
+    """
+    try:
+        await page.mouse.wheel(0, 900)
     except Exception:
         pass
 
 
-def _is_alive(page: ChromiumPage) -> bool:
+async def _safe_close(obj) -> None:
+    """Безопасно закрывает страницу / контекст."""
     try:
-        _ = page.title
-        return True
+        await obj.close()
     except Exception:
-        return False
+        pass
 
 
-# ─────────────────── главная точка входа ─────────────────────────────────────
+async def _ele(container, selector: str, timeout: float = 3.0):
+    """Найти один элемент. timeout > 0.5 → wait_for_selector."""
+    try:
+        if timeout > 0.5:
+            return await container.wait_for_selector(
+                selector, timeout=int(timeout * 1000), state="attached"
+            )
+        return await container.query_selector(selector)
+    except Exception:
+        return None
 
-def scrape_citilink(url: str, category_name: str) -> list[dict]:
+
+async def _eles(container, selector: str) -> list:
+    """Найти все элементы по CSS-селектору."""
+    try:
+        return await container.query_selector_all(selector)
+    except Exception:
+        return []
+
+
+async def _attr(el, attr_name: str) -> str:
+    """Получить атрибут элемента."""
+    try:
+        return await el.get_attribute(attr_name) or ""
+    except Exception:
+        return ""
+
+
+async def _text(el) -> str:
+    """Получить текст элемента."""
+    try:
+        return (await el.text_content() or "").strip()
+    except Exception:
+        return ""
+
+
+def _setup_page_handlers(page) -> None:
+    """
+    Подавляем JS-ошибки страницы и краши.
+    Именно они триггерят баг в FFBrowserContext на Node.js 24.
+    """
+    page.on("pageerror", lambda _: None)
+    page.on("crash",     lambda _: None)
+
+
+# ═════════════════════════ главная точка входа ═══════════════════════════════
+
+async def scrape_citilink(url: str, category_name: str) -> list[dict]:
     """
     Две фазы:
-    1. Каталог (с картинками) — один браузер собирает name + url + image
+    1. Каталог (с картинками) — собирает name + url + image
     2. Страницы товаров (без картинок) — батчами по BATCH_SIZE вкладок
     """
     log.info("[%s] Старт → %s", category_name, url)
 
-    # Фаза 1
-    product_data = _collect_catalog(url, category_name)
+    product_data = await _collect_catalog(url, category_name)
     if not product_data:
         log.warning("[%s] Каталог пуст", category_name)
         return []
 
     log.info("[%s] Фаза 2: характеристики %d товаров...", category_name, len(product_data))
 
-    # Фаза 2
     all_results: list[dict] = []
     for batch_start in range(0, len(product_data), BATCH_SIZE):
         batch = product_data[batch_start: batch_start + BATCH_SIZE]
-        batch_results = _process_batch(batch, category_name)
+        batch_results = await _process_batch(batch, category_name)
         all_results.extend(batch_results)
 
-        # Антибан — случайная пауза между батчами
         if batch_start + BATCH_SIZE < len(product_data):
-            time.sleep(random.uniform(0.8, 2.0))
+            await asyncio.sleep(random.uniform(0.8, 2.0))
 
     log.info("[%s] Готово. Итого: %d товаров", category_name, len(all_results))
     return all_results
 
 
-# ─────────────────── фаза 1: сбор каталога ───────────────────────────────────
+# ═══════════════════════ фаза 1: сбор каталога ═══════════════════════════════
 
-import random  # Не забудь добавить импорт в начало файла
-
-
-def _collect_catalog(url: str, category_name: str) -> list[dict]:
-    """
-    Обходит страницы каталога, собирает name + url + image.
-    Один браузер живёт на всё время — экономим на запуске Chrome.
-    """
+async def _collect_catalog(url: str, category_name: str) -> list[dict]:
+    """Обходит страницы каталога, собирает name + url + image."""
     product_data: list[dict] = []
-    # Набор имен товаров с предыдущей страницы для детекции дублей
-    last_page_product_names = set()
+    last_page_product_names: set[str] = set()
 
-    co = _make_options(load_images=True)
-    page = ChromiumPage(co)
+    browser_cm = _make_browser(block_images=False)
+
+    # Запускаем браузер вручную чтобы контролировать закрытие
+    try:
+        browser = await browser_cm.__aenter__()
+    except Exception as e:
+        log.error("[%s] Не удалось запустить браузер: %s", category_name, e)
+        return product_data
+
+    ctx  = None
+    page = None
 
     try:
+        ctx  = await browser.new_context()
+        page = await ctx.new_page()
+        _setup_page_handlers(page)
+
         current_page = 1
-        # Используем while True, чтобы PAGES_LIMIT = None означал бесконечный обход до конца
         while True:
-            # Если лимит задан и мы его превысили — выходим
             if PAGES_LIMIT is not None and current_page > PAGES_LIMIT:
                 break
 
@@ -172,64 +197,77 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
                 else f"{url.rstrip('/')}/?p={current_page}"
             )
 
-            if not _is_alive(page):
-                log.warning("[%s] Сессия умерла, переподключение...", category_name)
-                _safe_quit(page)
-                page = ChromiumPage(_make_options(load_images=True))
+            # Пересоздаём страницу если закрылась
+            try:
+                if page.is_closed():
+                    log.warning("[%s] Страница закрыта, пересоздаём...", category_name)
+                    page = await ctx.new_page()
+                    _setup_page_handlers(page)
+            except Exception:
+                pass
 
             try:
-                page.get(target_url)
-                time.sleep(PAGE_LOAD_PAUSE)
+                await page.goto(target_url, wait_until="domcontentloaded")
+                await asyncio.sleep(PAGE_LOAD_PAUSE)
             except Exception as e:
                 log.error("[%s] Не удалось загрузить %s: %s", category_name, target_url, e)
                 break
 
-            # Переключаем в подробный режим на первой странице
+            # Подробный режим на первой странице
             if current_page == 1:
                 try:
-                    label = page.ele(
-                        'css:label[for="Подробный режим каталога-list"]',
-                        timeout=4
+                    label = await page.wait_for_selector(
+                        'label[for="Подробный режим каталога-list"]',
+                        timeout=4000,
+                        state="attached"
                     )
                     if label:
-                        label.click()
-                        time.sleep(1.5)
+                        await label.click()
+                        await asyncio.sleep(1.5)
                 except Exception:
                     pass
 
             log.info("[%s] Страница %d", category_name, current_page)
 
-            # Прокрутка для lazy-load
+            # Прокрутка через mouse.wheel — не использует JS evaluate()
             for _ in range(SCROLL_STEPS):
-                page.scroll.down(900)
-                time.sleep(SCROLL_PAUSE)
+                await _scroll_page(page)
+                await asyncio.sleep(SCROLL_PAUSE)
 
             # Собираем карточки
-            items = (
-                    page.eles('css:[data-meta-name="SnippetProductHorizontalLayout"]')
-                    or page.eles('css:[data-meta-product-id]')
-            )
+            try:
+                items = await page.query_selector_all(
+                    '[data-meta-name="SnippetProductHorizontalLayout"]'
+                )
+                if not items:
+                    items = await page.query_selector_all('[data-meta-product-id]')
+            except Exception:
+                items = []
 
             if not items:
-                log.info("[%s] Стр.%d — товаров нет, конец каталога.", category_name, current_page)
+                log.info(
+                    "[%s] Стр.%d — товаров нет, конец каталога.",
+                    category_name, current_page
+                )
                 break
 
             page_products: list[dict] = []
-            current_page_names = set()  # Для проверки дубликатов страниц
+            current_page_names: set[str] = set()
 
             for item in items:
                 try:
-                    title_el = item.ele('css:[data-meta-name="Snippet__title"]', timeout=1)
+                    title_el = await item.query_selector(
+                        '[data-meta-name="Snippet__title"]'
+                    )
                     if not title_el:
                         continue
 
-                    href = title_el.attr("href") or ""
-                    name = (title_el.text or "").strip()
+                    href = await title_el.get_attribute("href") or ""
+                    name = (await title_el.text_content() or "").strip()
 
                     if not href or not name or len(name) < 5:
                         continue
 
-                    # Добавляем имя в набор текущей страницы
                     current_page_names.add(name)
 
                     full_url = (
@@ -239,10 +277,14 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
                     if not full_url.endswith('/properties/'):
                         full_url = full_url.rstrip('/') + '/properties/'
 
+                    # Изображение
                     image_url = ""
-                    img_el = item.ele("css:img", timeout=0.3)
+                    img_el = await item.query_selector("img")
                     if img_el:
-                        src = img_el.attr("data-src") or img_el.attr("src") or ""
+                        src = (
+                            await img_el.get_attribute("data-src") or
+                            await img_el.get_attribute("src") or ""
+                        )
                         if src.startswith("//"):
                             image_url = "https:" + src
                         elif src.startswith("/"):
@@ -251,21 +293,21 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
                             image_url = src
 
                     page_products.append({
-                        "name": name,
-                        "url": full_url,
-                        "image": image_url
+                        "name":  name,
+                        "url":   full_url,
+                        "image": image_url,
                     })
                 except Exception:
                     pass
 
-            # ПРОВЕРКА НА ДУБЛИКАТЫ СТРАНИЦЫ
-            # Если набор имен полностью совпадает с предыдущей страницей — мы зациклились
+            # Детекция дублей — конец каталога
             if current_page > 1 and current_page_names == last_page_product_names:
-                log.info("[%s] Контент страницы %d совпадает с %d. Это конец списка.",
-                         category_name, current_page, current_page - 1)
+                log.info(
+                    "[%s] Стр.%d совпадает с предыдущей — конец списка.",
+                    category_name, current_page
+                )
                 break
 
-            # Обновляем "память" парсера
             last_page_product_names = current_page_names
 
             if PRODUCTS_PER_PAGE:
@@ -274,52 +316,68 @@ def _collect_catalog(url: str, category_name: str) -> list[dict]:
             product_data.extend(page_products)
             log.info(
                 "[%s] Стр.%d — %d товаров (итого: %d)",
-                category_name, current_page,
-                len(page_products), len(product_data)
+                category_name, current_page, len(page_products), len(product_data)
             )
 
-            current_page += 1  # Идем на следующую страницу
-            time.sleep(random.uniform(PAGE_DELAY_MIN, PAGE_DELAY_MAX))
+            current_page += 1
+            await asyncio.sleep(random.uniform(PAGE_DELAY_MIN, PAGE_DELAY_MAX))
 
     except Exception as e:
         log.error("[%s] Критическая ошибка каталога: %s", category_name, e)
     finally:
-        _safe_quit(page)
+        if page:
+            await _safe_close(page)
+        if ctx:
+            await _safe_close(ctx)
+        await _close_browser_safe(browser, category_name)
 
     return product_data
 
 
-# ─────────────────── фаза 2: батч страниц товаров ────────────────────────────
+# ═══════════════════════ фаза 2: батч страниц товаров ════════════════════════
 
-def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
-    """
-    Открывает BATCH_SIZE вкладок без картинок,
-    параллельно ждёт загрузки, потом последовательно собирает данные.
-    """
-    co      = _make_options(load_images=False)
+async def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
+    """Открывает BATCH_SIZE страниц без картинок, собирает характеристики."""
     results: list[dict] = []
-    page    = ChromiumPage(co)
-    tabs:   list[dict] = []
+
+    browser_cm = _make_browser(block_images=True)
 
     try:
-        # Открываем все вкладки разом — они грузятся параллельно
+        browser = await browser_cm.__aenter__()
+    except Exception as e:
+        log.error("[%s] Не удалось запустить браузер (батч): %s", category_name, e)
+        return results
+
+    ctx = None
+
+    try:
+        ctx = await browser.new_context()
+        pages: list[dict] = []
+
+        # Открываем все вкладки параллельно
         for p in product_data:
             try:
-                tab = page.new_tab(p["url"])
-                tabs.append({"tab": tab, "product": p})
+                tab = await ctx.new_page()
+                _setup_page_handlers(tab)
+                await tab.goto(p["url"], wait_until="commit")
+                pages.append({"tab": tab, "product": p})
             except Exception as e:
-                log.debug("Вкладка не открылась %s: %s", p["url"], e)
+                log.debug("Страница не открылась %s: %s", p.get("url", ""), e)
 
-        # Ждём пока все вкладки загрузятся (eager — ждём DOM, не картинки)
-        time.sleep(BATCH_LOAD_PAUSE)
+        await asyncio.sleep(BATCH_LOAD_PAUSE)
 
         # Собираем данные последовательно
-        for entry in tabs:
+        for entry in pages:
             tab     = entry["tab"]
             product = entry["product"]
             try:
-                specs      = _collect_specs(tab)
-                price_text = _collect_price(tab)
+                try:
+                    await tab.wait_for_load_state("domcontentloaded", timeout=8000)
+                except Exception:
+                    pass
+
+                specs      = await _collect_specs(tab)
+                price_text = await _collect_price(tab)
                 extracted  = _extract_logic(category_name, product["name"], specs)
 
                 results.append({
@@ -337,30 +395,39 @@ def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
             except Exception as e:
                 log.debug("Ошибка %s: %s", product["name"][:40], e)
             finally:
-                try:
-                    tab.close()
-                except Exception:
-                    pass
+                await _safe_close(tab)
 
     except Exception as e:
-        log.error("Ошибка батча: %s", e)
+        log.error("[%s] Критическая ошибка батча: %s", category_name, e)
     finally:
-        _safe_quit(page)
+        if ctx:
+            await _safe_close(ctx)
+        await _close_browser_safe(browser, category_name)
 
     return results
 
 
-def _collect_specs(tab) -> dict:
+# ═══════════════════════ сбор характеристик ══════════════════════════════════
+
+async def _collect_specs(page) -> dict:
     specs = {}
     try:
-        rows = tab.eles('css:[class*="PropertiesItem"]', timeout=3)
+        try:
+            await page.wait_for_selector(
+                '[class*="PropertiesItem"]', timeout=3000, state="attached"
+            )
+        except Exception:
+            return specs
+
+        rows = await page.query_selector_all('[class*="PropertiesItem"]')
         for row in rows:
             try:
-                n = row.ele('css:[class*="PropertiesName"]',  timeout=0.1)
-                v = row.ele('css:[class*="PropertiesValue"]', timeout=0.1)
+                n = await row.query_selector('[class*="PropertiesName"]')
+                v = await row.query_selector('[class*="PropertiesValue"]')
                 if n and v:
-                    key = n.text.strip().rstrip(":")
-                    specs[key] = v.text.strip()
+                    key = (await n.text_content() or "").strip().rstrip(":")
+                    val = (await v.text_content() or "").strip()
+                    specs[key] = val
             except Exception:
                 pass
     except Exception:
@@ -368,11 +435,12 @@ def _collect_specs(tab) -> dict:
     return specs
 
 
-def _collect_price(tab) -> str:
+async def _collect_price(page) -> str:
     try:
-        el = tab.ele('css:[data-meta-name="PriceBlock__price"]', timeout=1)
+        el = await page.query_selector('[data-meta-name="PriceBlock__price"]')
         if el:
-            digits = "".join(filter(str.isdigit, el.text or ""))
+            text = (await el.text_content() or "").strip()
+            digits = "".join(filter(str.isdigit, text))
             if digits:
                 formatted = "{:,}".format(int(digits)).replace(",", " ")
                 return f"{formatted} руб"
@@ -382,45 +450,13 @@ def _collect_price(tab) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ИЗВЛЕЧЕНИЕ ХАРАКТЕРИСТИК
-#  socket             — CPU / MB / Cooler
-#  ramType            — CPU / MB / RAM
-#  ramSlots           — MB
-#  ramMaxFreq         — MB
-#  ramHeight          — RAM
-#  ramCapacity        — RAM
-#  tdp                — CPU
-#  maxTdp             — Cooler
-#  coolerHeight       — Cooler
-#  psuWattage         — PSU
-#  psuFormFactor      — PSU
-#  psuLength          — PSU
-#  cpuPowerPin        — PSU / MB
-#  gpuPowerPin        — PSU / GPU
-#  formFactor         — MB / Case / PSU
-#  pciVersion         — MB / GPU
-#  m2Slots            — MB
-#  m2Types            — MB
-#  gpuLength          — GPU
-#  gpuHeight          — GPU
-#  gpuSlots           — GPU
-#  gpuTdp             — GPU
-#  gpuReqPsu          — GPU
-#  gpuPciVersion      — GPU
-#  vram               — GPU
-#  gpuChipset         — GPU
-#  maxGpuLength       — Case
-#  maxCpuCoolerHeight — Case
-#  maxPsuLength       — Case
-#  supportedMbFormats — Case
-#  ssdInterface       — SSD
-#  ssdFormFactor      — SSD
-#  ssdCapacityGb      — SSD
+#  ИЗВЛЕЧЕНИЕ ХАРАКТЕРИСТИК (синхронная логика)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _empty_compat() -> dict:
     return {
         "socket":              "---",
+        "chipset":             "---",
         "ramType":             "---",
         "ramSlots":            0,
         "ramMaxFreq":          0,
@@ -432,6 +468,7 @@ def _empty_compat() -> dict:
         "psuWattage":          0,
         "psuFormFactor":       "---",
         "psuLength":           0,
+        "psuEfficiency":       "---",
         "cpuPowerPin":         "---",
         "gpuPowerPin":         "---",
         "formFactor":          "---",
@@ -457,14 +494,31 @@ def _empty_compat() -> dict:
 
 
 def _extract_logic(category: str, name: str, specs: dict) -> dict:
+    if category == "СЖО":
+        category = "Кулеры"
+    elif category == "SSD M.2":
+        category = "SSD"
+
     r  = _empty_compat()
     c  = {str(k).strip().lower(): str(v).strip() for k, v in specs.items()}
     cv = {k: v.lower() for k, v in c.items()}
-    full = (name + " " + " ".join(cv.keys()) + " " + " ".join(cv.values())).lower()
 
     def val(key_fragment: str) -> str:
         for k, v in cv.items():
             if key_fragment in k:
+                return v
+        return ""
+
+    def val_any(*key_fragments: str) -> str:
+        for fragment in key_fragments:
+            found = val(fragment)
+            if found:
+                return found
+        return ""
+
+    def val_all(*key_fragments: str) -> str:
+        for k, v in cv.items():
+            if all(fragment in k for fragment in key_fragments):
                 return v
         return ""
 
@@ -483,40 +537,62 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
                 return v
         return 0
 
+    full = (name + " " + " ".join(cv.keys()) + " " + " ".join(cv.values())).lower()
+
     if category == "Процессоры":
         r["socket"]  = _find_socket(full)
         r["ramType"] = _find_ddr(full, r["socket"])
-        r["tdp"]     = watt(val("тепловыделение")) or watt(val("tdp")) or first_int(val("tdp"), 10, 500)
+        r["tdp"]     = (
+            watt(val_any("тепловыделение", "энергопотребление")) or
+            watt(val("tdp")) or
+            first_int(val("tdp"), 10, 500)
+        )
 
     elif category == "Видеокарты":
-        r["gpuChipset"] = c.get("видеочипсет", "").split(",")[0].strip() or name
+        gpu_chipset = val_any(
+            "видеочипсет",
+            "графический процессор",
+            "gpu",
+            "модель графического процессора",
+        )
+        r["gpuChipset"] = gpu_chipset.split(",")[0].strip() or _find_gpu_chipset(name) or name[:80]
 
-        vram_str = val("объем видеопамяти") or val("память")
+        vram_str = val_any("объем видеопамяти", "объем памяти", "видеопамять", "память")
         m = re.search(r"(\d+)\s*гб", vram_str, re.I)
         r["vram"] = int(m.group(1)) if m else 0
 
-        r["gpuTdp"]    = (watt(val("максимальное энергопотребление")) or
-                           watt(val("энергопотребление")) or
-                           watt(val("tdp")))
-        r["gpuReqPsu"] = (watt(val("рекомендуемая мощность")) or
-                           watt(val("рекомендовано")) or
-                           watt(val("питание")))
+        r["gpuTdp"] = (
+            watt(val_any("максимальное энергопотребление", "потребление", "энергопотребление")) or
+            watt(val("tdp"))
+        )
+        r["gpuReqPsu"] = (
+            watt(val_any("рекомендуемая мощность", "рекомендованная мощность")) or
+            watt(val("рекомендовано")) or
+            watt(val("питание"))
+        )
         if r["gpuReqPsu"] == 0:
             r["gpuReqPsu"] = watt(full)
 
-        pin_str = val("разъемы дополнительного питания") or val("питание")
+        pin_str = val_any("разъемы дополнительного питания", "дополнительное питание", "питание")
         r["gpuPowerPin"] = _parse_gpu_pin(pin_str)
 
-        r["gpuLength"] = mm(val("длина видеокарты")) or _find_gpu_length(full)
-        r["gpuHeight"] = mm(val("высота видеокарты"))
+        r["gpuLength"] = (
+            mm(val_all("длина", "видеокарт")) or
+            mm(val_all("длина", "граф")) or
+            mm(val("длина")) or
+            _find_gpu_length(full)
+        )
+        r["gpuHeight"] = mm(val_all("высота", "видеокарт")) or mm(val("высота"))
 
-        slots_str = val("конструкция системы охлаждения")
+        slots_str = val_any("конструкция системы охлаждения", "занимаемых слотов", "слотов расширения")
         if "трёхслот" in slots_str or "трехслот" in slots_str or "3-slot" in slots_str:
             r["gpuSlots"] = 3
         elif "двухслот" in slots_str or "2-slot" in slots_str:
             r["gpuSlots"] = 2
         elif "однослот" in slots_str or "1-slot" in slots_str:
             r["gpuSlots"] = 1
+        else:
+            r["gpuSlots"] = first_int(slots_str, 1, 5)
 
         r["gpuPciVersion"] = _find_pci_version(full)
 
@@ -525,18 +601,28 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
         r["formFactor"] = _find_form_factor(full)
         r["ramType"]    = _find_ddr(full)
         r["pciVersion"] = _find_pci_version(full)
+        r["chipset"]    = val_any("чипсет", "набор системной логики").upper() or _find_chipset(full)
 
-        slots_raw = val("количество слотов памяти") or val("слотов памяти") or val("слоты памяти")
+        slots_raw = (
+            val("количество слотов памяти") or
+            val("слотов оперативной памяти") or
+            val("слотов памяти") or
+            val("слоты памяти")
+        )
         r["ramSlots"] = first_int(slots_raw, 1, 8)
 
-        freq_raw = val("максимальная частота памяти") or val("частота памяти")
+        freq_raw = val_any("максимальная частота памяти", "частота памяти", "частота оперативной памяти")
         r["ramMaxFreq"] = first_int(freq_raw, 800, 12000)
 
         r["cpuPowerPin"] = _parse_cpu_pin(
-            val("разъем питания процессора") or val("питание процессора")
+            val_any("разъем питания процессора", "питание процессора", "cpu power")
         )
 
-        m2_raw = val("количество разъемов m.2") or val("разъемов m.2") or val("m.2")
+        m2_raw = (
+            val("количество разъемов m.2") or
+            val("разъемов m.2") or
+            val("m.2")
+        )
         r["m2Slots"] = first_int(m2_raw, 0, 8)
         r["m2Types"] = _find_m2_types(full)
 
@@ -552,58 +638,80 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
 
     elif category == "Блоки питания":
         r["psuWattage"] = watt(val("мощность")) or first_int(val("мощность"), 200, 3000)
-        r["formFactor"] = _find_psu_form_factor(full)
+        r["psuFormFactor"] = _find_psu_form_factor(full)
+        r["formFactor"] = r["psuFormFactor"]
         r["psuLength"]  = mm(val("глубина")) or mm(val("длина"))
+        r["psuEfficiency"] = _find_psu_efficiency(full)
 
         r["cpuPowerPin"] = _parse_cpu_pin(
-            val("разъем cpu") or val("разъемов cpu") or
-            val("питания cpu") or val("разъем 8 pin")
+            val("разъем cpu") or
+            val("разъемов cpu") or
+            val("питания cpu") or
+            val("разъем 8 pin")
         )
         gpu_pin_raw = (
-                val("питание видеокарты") or
-                val("разъем pcie") or
-                val("разъемов pcie") or
-                val("разъем 6+2") or
-                val("12vhpwr") or
-                val("разъем 16") or
-                val("разъемы")  # fallback — если вдруг в общей строке
+            val("питание видеокарты") or
+            val("разъем pcie") or
+            val("разъемов pcie") or
+            val("разъем 6+2") or
+            val("12vhpwr") or
+            val("разъем 16") or
+            val("разъемы")
         )
-
         r["gpuPowerPin"] = _parse_gpu_pin(gpu_pin_raw)
 
     elif category == "Корпуса":
-        case_ff_raw = (val("форм-фактор совместимых") or
-                       val("типоразмер") or
-                       val("форм-фактор"))
-        r["formFactor"]        = _find_form_factor(case_ff_raw)
-        r["maxGpuLength"]      = mm(val("длина видеокарты")) or mm(val("макс. длина видеокарты"))
-        r["maxCpuCoolerHeight"]= (mm(val("высота кулера")) or
-                                   mm(val("макс. высота кулера")) or
-                                   mm(val("высота процессорного кулера")))
-        r["maxPsuLength"]      = mm(val("длина блока питания")) or mm(val("глубина блока питания"))
+        case_ff_raw = (
+            val_all("форм", "материн") or
+            val("форм-фактор совместимых") or
+            val("типоразмер") or
+            val("форм-фактор")
+        )
+        r["formFactor"]         = _find_form_factor(case_ff_raw)
+        r["maxGpuLength"]       = (
+            mm(val_all("длина", "видеокарт")) or
+            mm(val_all("длина", "граф")) or
+            mm(val("макс. длина видеокарты"))
+        )
+        r["maxCpuCoolerHeight"] = (
+            mm(val_all("высота", "кулер")) or
+            mm(val("макс. высота кулера")) or
+            mm(val("высота процессорного кулера"))
+        )
+        r["maxPsuLength"] = (
+            mm(val_all("длина", "блока питания")) or
+            mm(val_all("глубина", "блока питания"))
+        )
 
-        mb_fmt_raw = val("форм-фактор совместимых") or val("совместимые мп") or val("форм-фактор")
+        mb_fmt_raw = (
+            val_all("форм", "материн") or
+            val("форм-фактор совместимых") or
+            val("совместимые мп") or
+            val("форм-фактор")
+        )
         r["supportedMbFormats"] = _find_supported_mb_formats(mb_fmt_raw)
 
     elif category == "Кулеры":
-        compat_raw = val("совместимость") or val("сокет")
+        compat_raw = val_any("совместимость", "сокет", "поддерживаемые платформы")
         r["socket"]       = _find_all_sockets(compat_raw) if compat_raw else _find_socket(full)
-        r["maxTdp"]       = (watt(val("рассеиваемая мощность")) or
-                              watt(val("tdp")) or
-                              first_int(val("tdp"), 30, 500))
-        r["coolerHeight"] = mm(val("высота кулера")) or mm(val("высота"))
+        r["maxTdp"]       = (
+            watt(val("рассеиваемая мощность")) or
+            watt(val("tdp")) or
+            first_int(val("tdp"), 30, 500)
+        )
+        r["coolerHeight"] = mm(val_all("высота", "кулер")) or mm(val("высота"))
 
     elif category == "SSD":
         r["ssdInterface"]  = _find_ssd_interface(full)
         r["ssdFormFactor"] = _find_ssd_form_factor(full)
 
-        cap_str = val("объем") or val("ёмкость") or val("емкость")
+        cap_str = val_any("объем", "ёмкость", "емкость", "объём")
         r["ssdCapacityGb"] = _parse_capacity_gb(cap_str or full)
 
     return r
 
 
-# ─────────────────────── вспомогательные парсеры ─────────────────────────────
+# ─────────────────────────── вспомогательные парсеры ─────────────────────────
 
 def _normalize_lga(text: str) -> str:
     return re.sub(r'(?i)lga\s+(\d+)', r'LGA\1', text)
@@ -611,7 +719,10 @@ def _normalize_lga(text: str) -> str:
 
 def _find_socket(text: str) -> str:
     norm = _normalize_lga(text).upper()
-    for s in ["AM5", "AM4", "LGA1851", "LGA1700", "LGA1200", "LGA2066", "LGA2011", "LGA1366", "TR5", "SP3"]:
+    for s in [
+        "AM5", "AM4", "LGA1851", "LGA1700", "LGA1200",
+        "LGA2066", "LGA2011", "LGA1366", "TR5", "SP3"
+    ]:
         if s in norm:
             return s
     return "---"
@@ -631,7 +742,7 @@ def _find_all_sockets(text: str) -> str:
 
 
 def _find_ddr(text: str, socket: str = "") -> str:
-    if "ddr5" in text or socket == "AM5" or socket == "LGA1851":
+    if "ddr5" in text or socket in ("AM5", "LGA1851"):
         return "DDR5"
     if "ddr4" in text or socket == "AM4":
         return "DDR4"
@@ -651,10 +762,10 @@ def _find_pci_version(text: str) -> str:
 def _find_form_factor(text: str) -> str:
     for label, patterns in [
         ("E-ATX",    [r"e-atx"]),
-        ("ATX",      [r"\batx\b"]),
-        ("mATX",     [r"matx", r"micro-atx", r"m-atx"]),
         ("Mini-ITX", [r"mini-itx"]),
+        ("mATX",     [r"\bmatx\b", r"micro[-\s]?atx", r"\bm-atx\b"]),
         ("Flex-ATX", [r"flex-atx"]),
+        ("ATX",      [r"(^|[,\s;/])atx($|[,\s;/])"]),
     ]:
         for p in patterns:
             if re.search(p, text, re.IGNORECASE):
@@ -676,9 +787,9 @@ def _find_supported_mb_formats(text: str) -> list[str]:
     found = []
     mapping = [
         ("E-ATX",    r"e-atx"),
-        ("ATX",      r"\batx\b"),
-        ("mATX",     r"matx|micro-atx|m-atx"),
         ("Mini-ITX", r"mini-itx"),
+        ("mATX",     r"\bmatx\b|micro[-\s]?atx|\bm-atx\b"),
+        ("ATX",      r"(^|[,\s;/])atx($|[,\s;/])"),
     ]
     for label, pattern in mapping:
         if re.search(pattern, text, re.IGNORECASE):
@@ -686,10 +797,56 @@ def _find_supported_mb_formats(text: str) -> list[str]:
     return found
 
 
+def _find_chipset(text: str) -> str:
+    norm = text.upper()
+    chipsets = [
+        "X870E", "X870", "X670E", "X670", "B850", "B650E", "B650", "A620",
+        "X570", "B550", "A520", "X470", "B450", "A320", "X370", "B350",
+        "Z890", "B860", "H810", "Z790", "Z690", "H770", "H670", "B760",
+        "B660", "H610", "Z590", "Z490", "H570", "H510", "B560", "B460",
+        "W790", "W680", "TRX50", "TRX40",
+    ]
+    for chipset in chipsets:
+        if re.search(rf"\b{re.escape(chipset)}\b", norm):
+            return chipset
+    return "---"
+
+
+def _find_gpu_chipset(text: str) -> str:
+    patterns = [
+        r"\b(?:geforce\s+)?rtx\s*\d{3,4}(?:\s*(?:super|ti))?\b",
+        r"\b(?:geforce\s+)?gtx\s*\d{3,4}(?:\s*ti)?\b",
+        r"\bradeon\s+rx\s*\d{3,4}(?:\s*xt)?\b",
+        r"\brx\s*\d{3,4}(?:\s*xt)?\b",
+        r"\barc\s+[ab]\d{3,4}\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0)).strip()
+    return "---"
+
+
+def _find_psu_efficiency(text: str) -> str:
+    m = re.search(r"80\s*\+?\s*(white|bronze|silver|gold|platinum|titanium)", text, re.I)
+    if m:
+        return m.group(1).capitalize()
+    for label in ("Bronze", "Silver", "Gold", "Platinum", "Titanium"):
+        if re.search(rf"\b{label}\b", text, re.I):
+            return label
+    return "---"
+
+
 def _parse_cpu_pin(text: str) -> str:
     text = text.lower().strip()
     if not text or text == "---":
         return "---"
+    m = re.search(r"(\d+)\s*[x×]\s*(4\s*\+\s*4|8)", text)
+    if m:
+        count = int(m.group(1))
+        unit = "8" if "8" in m.group(2) else "4+4"
+        if unit in ("8", "4+4"):
+            return "+".join(["8"] * count) + " pin"
     if re.search(r"8\s*\+\s*8", text):
         return "8+8 pin"
     if re.search(r"8\s*\+\s*4", text):
@@ -709,6 +866,12 @@ def _parse_gpu_pin(text: str) -> str:
         return "без питания"
     if re.search(r"12vhpwr|12\s*v\s*hpwr|16\s*pin", text):
         return "12VHPWR (16 pin)"
+    m = re.search(r"(\d+)\s*[x×]\s*\(?\s*(6\s*\+\s*2|8|6)\s*\)?", text)
+    if m:
+        count = int(m.group(1))
+        unit_raw = m.group(2).replace(" ", "")
+        unit = "8" if unit_raw in ("6+2", "8") else "6"
+        return "+".join([unit] * count) + " pin"
     if re.search(r"8\s*\+\s*8\s*\+\s*8", text):
         return "8+8+8 pin"
     if re.search(r"8\s*\+\s*8", text):
@@ -767,11 +930,14 @@ def _parse_capacity_gb(text: str) -> int:
 
 
 def _find_gpu_length(text: str) -> int:
-    lengths = [int(x) for x in re.findall(r"(\d{3})\s*(?:мм|mm)", text) if 140 < int(x) < 500]
+    lengths = [
+        int(x) for x in re.findall(r"(\d{3})\s*(?:мм|mm)", text)
+        if 140 < int(x) < 500
+    ]
     return max(lengths) if lengths else 0
 
 
-# ─────────────────── файловые утилиты ────────────────────
+# ─────────────────────────── файловые утилиты ────────────────────────────────
 
 def load_from_file(filename: str = "components.json") -> dict | None:
     if not os.path.exists(filename):
@@ -791,36 +957,3 @@ def load_from_file(filename: str = "components.json") -> dict | None:
     except Exception as e:
         log.error("Не удалось загрузить %s: %s", filename, e)
         return None
-
-
-def save_to_db(data: dict) -> None:
-    """Заменяет save_to_file. Сохраняет весь спарсенный словарь в PostgreSQL"""
-    conn = None
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-
-        total_saved = 0
-        for category, products in data.items():
-            for item in products:
-                cur.execute("""
-                    INSERT INTO components (category, name, price, specs)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (name) DO UPDATE 
-                    SET price = EXCLUDED.price, 
-                        specs = EXCLUDED.specs,
-                        last_updated = CURRENT_TIMESTAMP;
-                """, (category, item['name'], item['price'], Json(item['specs'])))
-                total_saved += 1
-
-        conn.commit()
-        cur.close()
-        print(f">>> [✓] Успешно сохранено в БД: {total_saved} позиций")
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f">>> [!] Ошибка сохранения в PostgreSQL: {e}")
-    finally:
-        if conn:
-            conn.close()
