@@ -22,9 +22,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ───────────────────────── конфиг ─────────────────────────
-PAGES_LIMIT       = 1
-PRODUCTS_PER_PAGE = 3
+PAGES_LIMIT       = None
+PRODUCTS_PER_PAGE = None
 BATCH_SIZE        = 6
 SCROLL_STEPS      = 2
 SCROLL_PAUSE      = 0.25
@@ -32,13 +31,8 @@ PAGE_LOAD_PAUSE   = 1.2
 BATCH_LOAD_PAUSE  = 1.5
 PAGE_DELAY_MIN    = 1.0
 PAGE_DELAY_MAX    = 2.5
-# ──────────────────────────────────────────────────────────
-
-
-# ═══════════════════════ утилиты ═════════════════════════
 
 def _make_browser(block_images: bool = False, headless: bool = True) -> AsyncCamoufox:
-    """Создаёт контекст AsyncCamoufox (используется как async context manager)."""
     return AsyncCamoufox(
         headless=headless,
         os="windows",
@@ -49,10 +43,6 @@ def _make_browser(block_images: bool = False, headless: bool = True) -> AsyncCam
 
 
 async def _close_browser_safe(browser, category_name: str) -> None:
-    """
-    Безопасное закрытие браузера.
-    Игнорирует 'Connection closed' — баг Node.js 24 + Playwright/Firefox.
-    """
     try:
         await browser.close()
     except Exception as e:
@@ -70,10 +60,6 @@ async def _close_browser_safe(browser, category_name: str) -> None:
 
 
 async def _scroll_page(page) -> None:
-    """
-    Прокрутка через mouse.wheel вместо page.evaluate('window.scrollBy...').
-    Не использует JS-bridge — не падает при проблемах с драйвером на Node.js 24.
-    """
     try:
         await page.mouse.wheel(0, 900)
     except Exception:
@@ -81,7 +67,6 @@ async def _scroll_page(page) -> None:
 
 
 async def _safe_close(obj) -> None:
-    """Безопасно закрывает страницу / контекст."""
     try:
         await obj.close()
     except Exception:
@@ -89,7 +74,6 @@ async def _safe_close(obj) -> None:
 
 
 async def _ele(container, selector: str, timeout: float = 3.0):
-    """Найти один элемент. timeout > 0.5 → wait_for_selector."""
     try:
         if timeout > 0.5:
             return await container.wait_for_selector(
@@ -101,7 +85,6 @@ async def _ele(container, selector: str, timeout: float = 3.0):
 
 
 async def _eles(container, selector: str) -> list:
-    """Найти все элементы по CSS-селектору."""
     try:
         return await container.query_selector_all(selector)
     except Exception:
@@ -109,7 +92,6 @@ async def _eles(container, selector: str) -> list:
 
 
 async def _attr(el, attr_name: str) -> str:
-    """Получить атрибут элемента."""
     try:
         return await el.get_attribute(attr_name) or ""
     except Exception:
@@ -117,7 +99,6 @@ async def _attr(el, attr_name: str) -> str:
 
 
 async def _text(el) -> str:
-    """Получить текст элемента."""
     try:
         return (await el.text_content() or "").strip()
     except Exception:
@@ -125,10 +106,6 @@ async def _text(el) -> str:
 
 
 def _setup_page_handlers(page) -> None:
-    """
-    Подавляем JS-ошибки страницы и краши.
-    Именно они триггерят баг в FFBrowserContext на Node.js 24.
-    """
     page.on("pageerror", lambda _: None)
     page.on("crash",     lambda _: None)
 
@@ -136,11 +113,6 @@ def _setup_page_handlers(page) -> None:
 # ═════════════════════════ главная точка входа ═══════════════════════════════
 
 async def scrape_citilink(url: str, category_name: str) -> list[dict]:
-    """
-    Две фазы:
-    1. Каталог (с картинками) — собирает name + url + image
-    2. Страницы товаров (без картинок) — батчами по BATCH_SIZE вкладок
-    """
     log.info("[%s] Старт → %s", category_name, url)
 
     product_data = await _collect_catalog(url, category_name)
@@ -163,16 +135,12 @@ async def scrape_citilink(url: str, category_name: str) -> list[dict]:
     return all_results
 
 
-# ═══════════════════════ фаза 1: сбор каталога ═══════════════════════════════
-
 async def _collect_catalog(url: str, category_name: str) -> list[dict]:
-    """Обходит страницы каталога, собирает name + url + image."""
     product_data: list[dict] = []
     last_page_product_names: set[str] = set()
 
     browser_cm = _make_browser(block_images=False)
 
-    # Запускаем браузер вручную чтобы контролировать закрытие
     try:
         browser = await browser_cm.__aenter__()
     except Exception as e:
@@ -197,7 +165,6 @@ async def _collect_catalog(url: str, category_name: str) -> list[dict]:
                 else f"{url.rstrip('/')}/?p={current_page}"
             )
 
-            # Пересоздаём страницу если закрылась
             try:
                 if page.is_closed():
                     log.warning("[%s] Страница закрыта, пересоздаём...", category_name)
@@ -229,12 +196,10 @@ async def _collect_catalog(url: str, category_name: str) -> list[dict]:
 
             log.info("[%s] Страница %d", category_name, current_page)
 
-            # Прокрутка через mouse.wheel — не использует JS evaluate()
             for _ in range(SCROLL_STEPS):
                 await _scroll_page(page)
                 await asyncio.sleep(SCROLL_PAUSE)
 
-            # Собираем карточки
             try:
                 items = await page.query_selector_all(
                     '[data-meta-name="SnippetProductHorizontalLayout"]'
@@ -300,7 +265,6 @@ async def _collect_catalog(url: str, category_name: str) -> list[dict]:
                 except Exception:
                     pass
 
-            # Детекция дублей — конец каталога
             if current_page > 1 and current_page_names == last_page_product_names:
                 log.info(
                     "[%s] Стр.%d совпадает с предыдущей — конец списка.",
@@ -333,11 +297,7 @@ async def _collect_catalog(url: str, category_name: str) -> list[dict]:
 
     return product_data
 
-
-# ═══════════════════════ фаза 2: батч страниц товаров ════════════════════════
-
 async def _process_batch(product_data: list[dict], category_name: str) -> list[dict]:
-    """Открывает BATCH_SIZE страниц без картинок, собирает характеристики."""
     results: list[dict] = []
 
     browser_cm = _make_browser(block_images=True)
@@ -354,7 +314,6 @@ async def _process_batch(product_data: list[dict], category_name: str) -> list[d
         ctx = await browser.new_context()
         pages: list[dict] = []
 
-        # Открываем все вкладки параллельно
         for p in product_data:
             try:
                 tab = await ctx.new_page()
@@ -366,7 +325,6 @@ async def _process_batch(product_data: list[dict], category_name: str) -> list[d
 
         await asyncio.sleep(BATCH_LOAD_PAUSE)
 
-        # Собираем данные последовательно
         for entry in pages:
             tab     = entry["tab"]
             product = entry["product"]
@@ -406,9 +364,6 @@ async def _process_batch(product_data: list[dict], category_name: str) -> list[d
 
     return results
 
-
-# ═══════════════════════ сбор характеристик ══════════════════════════════════
-
 async def _collect_specs(page) -> dict:
     specs = {}
     try:
@@ -447,11 +402,6 @@ async def _collect_price(page) -> str:
     except Exception:
         pass
     return "---"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ИЗВЛЕЧЕНИЕ ХАРАКТЕРИСТИК (синхронная логика)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _empty_compat() -> dict:
     return {
@@ -732,9 +682,6 @@ def _extract_logic(category: str, name: str, specs: dict) -> dict:
 
     return r
 
-
-# ─────────────────────────── вспомогательные парсеры ─────────────────────────
-
 def _normalize_lga(text: str) -> str:
     return re.sub(r'(?i)lga\s+(\d+)', r'LGA\1', text)
 
@@ -957,25 +904,3 @@ def _find_gpu_length(text: str) -> int:
         if 140 < int(x) < 500
     ]
     return max(lengths) if lengths else 0
-
-
-# ─────────────────────────── файловые утилиты ────────────────────────────────
-
-def load_from_file(filename: str = "components.json") -> dict | None:
-    if not os.path.exists(filename):
-        return None
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for category, items in data.items():
-            for item in items:
-                if "id" not in item:
-                    item["id"] = abs(hash(item.get("name", "") + category)) % (10 ** 9)
-                if category == "Кулеры" and "specs" in item:
-                    compat = item["specs"].get("Совместимость", "")
-                    if compat:
-                        item["socket"] = _find_all_sockets(compat)
-        return data
-    except Exception as e:
-        log.error("Не удалось загрузить %s: %s", filename, e)
-        return None

@@ -32,11 +32,9 @@ log = logging.getLogger(__name__)
 
 SHOULD_PARSE = os.getenv("ENABLE_PARSER", "false").lower() == "true"
 
-# Глобальный кэш и его async-блокировка
 cache: dict = {}
 cache_lock = asyncio.Lock()
 
-# Для синхронных функций (save_to_db и т.д.) нужен threading.Lock
 cache_lock_sync = threading.Lock()
 
 COMPAT_KEYS = (
@@ -50,36 +48,32 @@ COMPAT_KEYS = (
     "ssdCapacityGb",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  КАТЕГОРИИ И URL
-# ─────────────────────────────────────────────────────────────────────────────
-
 URLS_CITILINK = {
-    # "Видеокарты":         "https://www.citilink.ru/catalog/videokarty/",
-    # "Процессоры":         "https://www.citilink.ru/catalog/processory/",
-    # "Материнские платы":  "https://www.citilink.ru/catalog/materinskie-platy/",
-    # "Оперативная память": "https://www.citilink.ru/catalog/moduli-pamyati/",
-    # "Блоки питания":      "https://www.citilink.ru/catalog/bloki-pitaniya/",
-    # "Корпуса":            "https://www.citilink.ru/catalog/korpusa/",
-    # "SSD":                "https://www.citilink.ru/catalog/ssd-nakopiteli/",
-    # "Кулеры":             "https://www.citilink.ru/catalog/sistemy-ohlazhdeniya-processora/",
+    "Видеокарты":         "https://www.citilink.ru/catalog/videokarty/",
+    "Процессоры":         "https://www.citilink.ru/catalog/processory/",
+    "Материнские платы":  "https://www.citilink.ru/catalog/materinskie-platy/",
+    "Оперативная память": "https://www.citilink.ru/catalog/moduli-pamyati/",
+    "Блоки питания":      "https://www.citilink.ru/catalog/bloki-pitaniya/",
+    "Корпуса":            "https://www.citilink.ru/catalog/korpusa/",
+    "SSD":                "https://www.citilink.ru/catalog/ssd-nakopiteli/",
+    "Кулеры":             "https://www.citilink.ru/catalog/sistemy-ohlazhdeniya-processora/",
 }
 
 URLS_REGARD = {
-    # "Кулеры":            "https://www.regard.ru/catalog/5162/kulery-dlya-processorov",
-    # "СЖО":               "https://www.regard.ru/catalog/1008/zidkostnoe-oxlazdenie-szo",
-    # "Материнские платы": "https://www.regard.ru/catalog/1000/materinskie-platy",
-    # "Блоки питания":     "https://www.regard.ru/catalog/1225/bloki-pitaniya",
-    # "Оперативная память":"https://www.regard.ru/catalog/1010/operativnaya-pamyat",
-    # "Процессоры":        "https://www.regard.ru/catalog/1001/processory",
-    # "Видеокарты":        "https://www.regard.ru/catalog/1013/videokarty",
-    # "SSD":               "https://www.regard.ru/catalog/1015/nakopiteli-ssd",
-    # "Корпуса":           "https://www.regard.ru/catalog/1032/korpusa",
+    "Кулеры":            "https://www.regard.ru/catalog/5162/kulery-dlya-processorov",
+    "СЖО":               "https://www.regard.ru/catalog/1008/zidkostnoe-oxlazdenie-szo",
+    "Материнские платы": "https://www.regard.ru/catalog/1000/materinskie-platy",
+    "Блоки питания":     "https://www.regard.ru/catalog/1225/bloki-pitaniya",
+    "Оперативная память":"https://www.regard.ru/catalog/1010/operativnaya-pamyat",
+    "Процессоры":        "https://www.regard.ru/catalog/1001/processory",
+    "Видеокарты":        "https://www.regard.ru/catalog/1013/videokarty",
+    "SSD":               "https://www.regard.ru/catalog/1015/nakopiteli-ssd",
+    "Корпуса":           "https://www.regard.ru/catalog/1032/korpusa",
 }
 
 URLS_DNS = {
-    # "Процессоры":         "https://www.dns-shop.ru/catalog/17a899cd16404e77/processory/",
-    # "Материнские платы":  "https://www.dns-shop.ru/catalog/17a89a0416404e77/materinskie-platy/",
+    "Процессоры":         "https://www.dns-shop.ru/catalog/17a899cd16404e77/processory/",
+    "Материнские платы":  "https://www.dns-shop.ru/catalog/17a89a0416404e77/materinskie-platy/",
     "Видеокарты":         "https://www.dns-shop.ru/catalog/17a89aab16404e77/videokarty/",
     "Оперативная память": "https://www.dns-shop.ru/catalog/17a89a3916404e77/operativnaa-pamat-dimm/",
     "Блоки питания":      "https://www.dns-shop.ru/catalog/17a89c2216404e77/bloki-pitania/",
@@ -92,10 +86,6 @@ URLS_DNS = {
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  LIFESPAN
-# ─────────────────────────────────────────────────────────────────────────────
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global cache
@@ -105,7 +95,6 @@ async def lifespan(app: FastAPI):
     print(f">>> [CONFIG] ПАРСЕР ВКЛЮЧЕН: {SHOULD_PARSE}")
     print("=" * 70)
 
-    # 1. Загрузка кэша из БД (синхронная — запускаем в executor)
     try:
         loop = asyncio.get_event_loop()
         loaded = await loop.run_in_executor(None, load_all_from_db)
@@ -122,9 +111,6 @@ async def lifespan(app: FastAPI):
         print(f">>> [!] Ошибка подключения к БД: {e}")
         cache = {}
 
-    # 2. Запуск async парсеров как одной последовательной фоновой задачи.
-    # Так не ломается матчинг: Citilink сначала наполняет базу имен,
-    # затем Regard и DNS доклеивают цены/specs/compat к тем же компонентам.
     if SHOULD_PARSE:
         asyncio.create_task(
             _parse_all_stores_async(),
@@ -135,11 +121,6 @@ async def lifespan(app: FastAPI):
     yield
 
     print(">>> [SYSTEM] Сервер остановлен")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ASYNC ПАРСИНГ
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _has_parsed_value(value) -> bool:
     return value not in (None, "", "---", 0, [], {})
@@ -161,7 +142,6 @@ def _merge_parsed_item_into_cache(cached_item: dict, parsed_item: dict) -> None:
 
 
 def _merge_parsed_items_with_existing_cache(category: str, parsed_items: list[dict]) -> list[dict]:
-    """Сохраняет стабильные id и цены других магазинов при обновлении категории."""
     existing_items = cache.get(category, [])
     existing_names = [item.get("name", "") for item in existing_items if item.get("name")]
     existing_by_name = {item["name"]: item for item in existing_items if item.get("name")}
@@ -197,7 +177,6 @@ def _merge_parsed_items_with_existing_cache(category: str, parsed_items: list[di
 
 
 async def _parse_all_stores_async() -> None:
-    """Парсит магазины последовательно, чтобы матчинг работал стабильно."""
     await _parse_store_async(URLS_CITILINK, "citilink")
     await asyncio.sleep(random.uniform(5.0, 9.0))
     await _parse_store_async(URLS_REGARD, "regard")
@@ -206,10 +185,6 @@ async def _parse_all_stores_async() -> None:
 
 
 async def _parse_store_async(urls: dict, store_name: str) -> None:
-    """
-    Async-функция парсинга одного магазина.
-    Запускается как asyncio.Task через create_task().
-    """
     global cache
 
     if not urls:
@@ -264,14 +239,12 @@ async def _parse_store_async(urls: dict, store_name: str) -> None:
                 "Детали ошибки парсинга %s / %s", store_name, category
             )
 
-        # Антибан: пауза между категориями
         await asyncio.sleep(random.uniform(3.0, 7.0))
 
     print(f"\n>>> [✓] ЦИКЛ ПАРСИНГА {store_name.upper()} ЗАВЕРШЁН\n")
 
 
 async def _save_regard_with_matching_async(category: str, regard_items: list[dict]) -> None:
-    """Сохранение товаров Регарда с матчингом (async версия)."""
     global cache
 
     loop = asyncio.get_event_loop()
@@ -328,7 +301,6 @@ async def _save_regard_with_matching_async(category: str, regard_items: list[dic
 
 
 async def _save_dns_with_matching_async(category: str, dns_items: list[dict]) -> None:
-    """Сохранение товаров DNS с матчингом по текущему кэшу."""
     global cache
 
     loop = asyncio.get_event_loop()
@@ -383,21 +355,12 @@ async def _save_dns_with_matching_async(category: str, dns_items: list[dict]) ->
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  FastAPI ПРИЛОЖЕНИЕ
-# ─────────────────────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="PC Builder API",
     description="API для сборки ПК — Ситилинк + Регард + DNS, PostgreSQL",
     version="3.0",
     lifespan=lifespan
 )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def _find_component_by_id(component_id: int) -> dict | None:
     if component_id is None:
@@ -421,15 +384,14 @@ async def _find_components_by_ids(ids: list[int]) -> list[dict]:
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ЭНДПОИНТЫ
-# ─────────────────────────────────────────────────────────────────────────────
-
 @app.get("/components")
 async def get_components(category: str):
-    """Возвращает список компонентов по категории."""
     async with cache_lock:
         components = list(cache.get(category, []))
+        if category == "Кулеры":
+            components.extend(cache.get("СЖО", []))
+        elif category == "SSD":
+            components.extend(cache.get("SSD M.2", []))
     return {
         "category":   category,
         "count":      len(components),
@@ -448,7 +410,6 @@ async def check_compatibility(
     cooler_id: Optional[int]       = Query(None),
     ssd_id:    Optional[list[int]] = Query(None),
 ):
-    """Проверка совместимости сборки."""
     cpu    = await _find_component_by_id(cpu_id)
     mb     = await _find_component_by_id(mb_id)
     psu    = await _find_component_by_id(psu_id)
@@ -469,7 +430,6 @@ async def check_compatibility(
 
 @app.get("/health")
 async def health():
-    """Проверка состояния сервера."""
     async with cache_lock:
         cats  = {k: len(v) for k, v in cache.items()}
         total = sum(cats.values())

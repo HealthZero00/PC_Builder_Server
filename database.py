@@ -3,9 +3,9 @@
 """
 
 """
-database.py — работа с PostgreSQL для PC Builder
-
+database.py — работа с PostgreSQL для Вольтажа
 """
+
 import os
 import json
 import logging
@@ -43,28 +43,27 @@ def get_connections() -> List[pg8000.native.Connection]:
             log.error("Ошибка подключения к БД %s: %s", cfg["host"], e)
     return active
 
+def _nn(val, max_len: int | None = None) -> Optional[str]:
+    if not val or val == "---":
+        return None
+    text = str(val)
+    return text[:max_len] if max_len else text
 
-# ══════════════════════════════════════════════════════════════
-#  ИЗВЛЕЧЕНИЕ ЦЕНЫ
-# ══════════════════════════════════════════════════════════════
 
-def _extract_price_rub(item: dict) -> int:
-    """
-    Корректно извлекает цену из словаря товара.
-    Фильтрует "---" и пустые значения.
-    """
-    candidates = [
-        item.get("priceCitilink"),
-        item.get("priceRegard"),
-        item.get("priceDNS"),
-        item.get("price"),
-    ]
-    raw_price = next(
-        (v for v in candidates if v and str(v).strip() not in ("---", "0", "")),
-        "0"
-    )
-    digits = "".join(filter(str.isdigit, str(raw_price)))
-    return int(digits) if digits else 0
+def _ni(val) -> Optional[int]:
+    try:
+        v = int(float(str(val)))
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def _na(val) -> Optional[list]:
+    return list(val) if val and isinstance(val, (list, tuple)) else None
+
+
+def _has_value(value) -> bool:
+    return value not in (None, "", "---", 0, [], {})
 
 
 def _decode_specs(raw) -> dict:
@@ -79,8 +78,59 @@ def _decode_specs(raw) -> dict:
         return {}
 
 
-def _has_value(value) -> bool:
-    return value not in (None, "", "---", 0, [], {})
+def _extract_price_rub(item: dict) -> int:
+    candidates = [
+        item.get("priceCitilink"),
+        item.get("priceRegard"),
+        item.get("priceDNS"),
+        item.get("price"),
+    ]
+    raw_price = next(
+        (v for v in candidates if v and str(v).strip() not in ("---", "0", "")),
+        "0"
+    )
+    digits = "".join(filter(str.isdigit, str(raw_price)))
+    return int(digits) if digits else 0
+
+
+def _extract_compat_fields(item: dict) -> dict:
+    return {
+        "socket":            item.get("socket"),
+        "chipset":           item.get("chipset"),
+        "ramType":           item.get("ramType"),
+        "ramSlots":          item.get("ramSlots"),
+        "ramMaxFreq":        item.get("ramMaxFreq"),
+        "ramHeight":         item.get("ramHeight"),
+        "ramCapacity":       item.get("ramCapacity"),
+        "tdp":               item.get("tdp"),
+        "cpuPowerPin":       item.get("cpuPowerPin"),
+        "maxTdp":            item.get("maxTdp"),
+        "coolerHeight":      item.get("coolerHeight"),
+        "psuWattage":        item.get("psuWattage"),
+        "psuFormFactor":     item.get("psuFormFactor"),
+        "psuLength":         item.get("psuLength"),
+        "psuEfficiency":     item.get("psuEfficiency") or item.get("psuCertification"),
+        "gpuPowerPin":       item.get("gpuPowerPin"),
+        "formFactor":        item.get("formFactor"),
+        "pciVersion":        item.get("pciVersion"),
+        "m2Slots":           item.get("m2Slots"),
+        "m2Types":           item.get("m2Types"),
+        "gpuChipset":        item.get("gpuChipset"),
+        "vram":              item.get("vram"),
+        "gpuLength":         item.get("gpuLength"),
+        "gpuHeight":         item.get("gpuHeight"),
+        "gpuSlots":          item.get("gpuSlots"),
+        "gpuTdp":            item.get("gpuTdp"),
+        "gpuReqPsu":         item.get("gpuReqPsu"),
+        "gpuPciVersion":     item.get("gpuPciVersion"),
+        "maxGpuLength":      item.get("maxGpuLength"),
+        "maxCpuCoolerHeight": item.get("maxCpuCoolerHeight"),
+        "maxPsuLength":      item.get("maxPsuLength"),
+        "supportedMbFormats": item.get("supportedMbFormats"),
+        "ssdInterface":      item.get("ssdInterface"),
+        "ssdFormFactor":     item.get("ssdFormFactor"),
+        "ssdCapacityGb":     item.get("ssdCapacityGb"),
+    }
 
 
 def _upsert_component_compat(
@@ -88,7 +138,6 @@ def _upsert_component_compat(
     component_id: int,
     compat: dict,
 ) -> None:
-    """Записывает поля совместимости в component_compat."""
     conn.run(
         """
         INSERT INTO component_compat (
@@ -113,41 +162,41 @@ def _upsert_component_compat(
             :ssd_iface, :ssd_ff, :ssd_gb
         )
         ON CONFLICT (component_id) DO UPDATE SET
-            socket                   = COALESCE(EXCLUDED.socket, component_compat.socket),
-            chipset                  = COALESCE(EXCLUDED.chipset, component_compat.chipset),
-            ram_type                 = COALESCE(EXCLUDED.ram_type, component_compat.ram_type),
-            ram_slots                = COALESCE(EXCLUDED.ram_slots, component_compat.ram_slots),
-            ram_max_freq_mhz         = COALESCE(EXCLUDED.ram_max_freq_mhz, component_compat.ram_max_freq_mhz),
-            ram_height_mm            = COALESCE(EXCLUDED.ram_height_mm, component_compat.ram_height_mm),
-            ram_capacity_gb          = COALESCE(EXCLUDED.ram_capacity_gb, component_compat.ram_capacity_gb),
-            tdp_w                    = COALESCE(EXCLUDED.tdp_w, component_compat.tdp_w),
-            cpu_power_pin            = COALESCE(EXCLUDED.cpu_power_pin, component_compat.cpu_power_pin),
-            max_tdp_w                = COALESCE(EXCLUDED.max_tdp_w, component_compat.max_tdp_w),
-            cooler_height_mm         = COALESCE(EXCLUDED.cooler_height_mm, component_compat.cooler_height_mm),
-            psu_wattage_w            = COALESCE(EXCLUDED.psu_wattage_w, component_compat.psu_wattage_w),
-            psu_form_factor          = COALESCE(EXCLUDED.psu_form_factor, component_compat.psu_form_factor),
-            psu_length_mm            = COALESCE(EXCLUDED.psu_length_mm, component_compat.psu_length_mm),
-            psu_efficiency           = COALESCE(EXCLUDED.psu_efficiency, component_compat.psu_efficiency),
-            gpu_power_pin            = COALESCE(EXCLUDED.gpu_power_pin, component_compat.gpu_power_pin),
-            form_factor              = COALESCE(EXCLUDED.form_factor, component_compat.form_factor),
-            pci_version              = COALESCE(EXCLUDED.pci_version, component_compat.pci_version),
-            m2_slots                 = COALESCE(EXCLUDED.m2_slots, component_compat.m2_slots),
-            m2_types                 = COALESCE(EXCLUDED.m2_types, component_compat.m2_types),
-            gpu_chipset              = COALESCE(EXCLUDED.gpu_chipset, component_compat.gpu_chipset),
-            vram_gb                  = COALESCE(EXCLUDED.vram_gb, component_compat.vram_gb),
-            gpu_length_mm            = COALESCE(EXCLUDED.gpu_length_mm, component_compat.gpu_length_mm),
-            gpu_height_mm            = COALESCE(EXCLUDED.gpu_height_mm, component_compat.gpu_height_mm),
-            gpu_slots                = COALESCE(EXCLUDED.gpu_slots, component_compat.gpu_slots),
-            gpu_tdp_w                = COALESCE(EXCLUDED.gpu_tdp_w, component_compat.gpu_tdp_w),
-            gpu_req_psu_w            = COALESCE(EXCLUDED.gpu_req_psu_w, component_compat.gpu_req_psu_w),
-            gpu_pci_version          = COALESCE(EXCLUDED.gpu_pci_version, component_compat.gpu_pci_version),
-            max_gpu_length_mm        = COALESCE(EXCLUDED.max_gpu_length_mm, component_compat.max_gpu_length_mm),
+            socket                   = COALESCE(EXCLUDED.socket,                   component_compat.socket),
+            chipset                  = COALESCE(EXCLUDED.chipset,                  component_compat.chipset),
+            ram_type                 = COALESCE(EXCLUDED.ram_type,                 component_compat.ram_type),
+            ram_slots                = COALESCE(EXCLUDED.ram_slots,                component_compat.ram_slots),
+            ram_max_freq_mhz         = COALESCE(EXCLUDED.ram_max_freq_mhz,         component_compat.ram_max_freq_mhz),
+            ram_height_mm            = COALESCE(EXCLUDED.ram_height_mm,            component_compat.ram_height_mm),
+            ram_capacity_gb          = COALESCE(EXCLUDED.ram_capacity_gb,          component_compat.ram_capacity_gb),
+            tdp_w                    = COALESCE(EXCLUDED.tdp_w,                    component_compat.tdp_w),
+            cpu_power_pin            = COALESCE(EXCLUDED.cpu_power_pin,            component_compat.cpu_power_pin),
+            max_tdp_w                = COALESCE(EXCLUDED.max_tdp_w,                component_compat.max_tdp_w),
+            cooler_height_mm         = COALESCE(EXCLUDED.cooler_height_mm,         component_compat.cooler_height_mm),
+            psu_wattage_w            = COALESCE(EXCLUDED.psu_wattage_w,            component_compat.psu_wattage_w),
+            psu_form_factor          = COALESCE(EXCLUDED.psu_form_factor,          component_compat.psu_form_factor),
+            psu_length_mm            = COALESCE(EXCLUDED.psu_length_mm,            component_compat.psu_length_mm),
+            psu_efficiency           = COALESCE(EXCLUDED.psu_efficiency,           component_compat.psu_efficiency),
+            gpu_power_pin            = COALESCE(EXCLUDED.gpu_power_pin,            component_compat.gpu_power_pin),
+            form_factor              = COALESCE(EXCLUDED.form_factor,              component_compat.form_factor),
+            pci_version              = COALESCE(EXCLUDED.pci_version,              component_compat.pci_version),
+            m2_slots                 = COALESCE(EXCLUDED.m2_slots,                 component_compat.m2_slots),
+            m2_types                 = COALESCE(EXCLUDED.m2_types,                 component_compat.m2_types),
+            gpu_chipset              = COALESCE(EXCLUDED.gpu_chipset,              component_compat.gpu_chipset),
+            vram_gb                  = COALESCE(EXCLUDED.vram_gb,                  component_compat.vram_gb),
+            gpu_length_mm            = COALESCE(EXCLUDED.gpu_length_mm,            component_compat.gpu_length_mm),
+            gpu_height_mm            = COALESCE(EXCLUDED.gpu_height_mm,            component_compat.gpu_height_mm),
+            gpu_slots                = COALESCE(EXCLUDED.gpu_slots,                component_compat.gpu_slots),
+            gpu_tdp_w                = COALESCE(EXCLUDED.gpu_tdp_w,                component_compat.gpu_tdp_w),
+            gpu_req_psu_w            = COALESCE(EXCLUDED.gpu_req_psu_w,            component_compat.gpu_req_psu_w),
+            gpu_pci_version          = COALESCE(EXCLUDED.gpu_pci_version,          component_compat.gpu_pci_version),
+            max_gpu_length_mm        = COALESCE(EXCLUDED.max_gpu_length_mm,        component_compat.max_gpu_length_mm),
             max_cpu_cooler_height_mm = COALESCE(EXCLUDED.max_cpu_cooler_height_mm, component_compat.max_cpu_cooler_height_mm),
-            max_psu_length_mm        = COALESCE(EXCLUDED.max_psu_length_mm, component_compat.max_psu_length_mm),
-            supported_mb_formats     = COALESCE(EXCLUDED.supported_mb_formats, component_compat.supported_mb_formats),
-            ssd_interface            = COALESCE(EXCLUDED.ssd_interface, component_compat.ssd_interface),
-            ssd_form_factor          = COALESCE(EXCLUDED.ssd_form_factor, component_compat.ssd_form_factor),
-            ssd_capacity_gb          = COALESCE(EXCLUDED.ssd_capacity_gb, component_compat.ssd_capacity_gb),
+            max_psu_length_mm        = COALESCE(EXCLUDED.max_psu_length_mm,        component_compat.max_psu_length_mm),
+            supported_mb_formats     = COALESCE(EXCLUDED.supported_mb_formats,     component_compat.supported_mb_formats),
+            ssd_interface            = COALESCE(EXCLUDED.ssd_interface,            component_compat.ssd_interface),
+            ssd_form_factor          = COALESCE(EXCLUDED.ssd_form_factor,          component_compat.ssd_form_factor),
+            ssd_capacity_gb          = COALESCE(EXCLUDED.ssd_capacity_gb,          component_compat.ssd_capacity_gb),
             updated_at               = now()
         """,
         cid=component_id,
@@ -188,10 +237,16 @@ def _upsert_component_compat(
         ssd_gb=_ni(compat.get("ssdCapacityGb")),
     )
 
+def _is_valid_image_url(url: str) -> bool:
+    if not url or url == "---":
+        return False
+    url = url.strip()
+    if not url.startswith("http"):
+        return False
+    if url.startswith("data:"):
+        return False
+    return True
 
-# ══════════════════════════════════════════════════════════════
-#  СОХРАНЕНИЕ ТОВАРА
-# ══════════════════════════════════════════════════════════════
 
 def save_to_db(category_name: str, items_list: list, store: str = "citilink") -> int:
     conns = get_connections()
@@ -199,7 +254,6 @@ def save_to_db(category_name: str, items_list: list, store: str = "citilink") ->
         log.error("save_to_db: Нет доступных подключений!")
         return 0
 
-    # Импортируем маmatching для поиска дубликатов по нечеткому имени / артикулу
     import matcher
 
     saved_count = 0
@@ -213,42 +267,66 @@ def save_to_db(category_name: str, items_list: list, store: str = "citilink") ->
             specs_json = json.dumps(item.get("specs") or {}, ensure_ascii=False)
             compat = _extract_compat_fields(item)
 
+            new_image_url = item.get("imageUrl") or ""
+            image_is_valid = _is_valid_image_url(new_image_url)
+
             for conn in conns:
                 try:
-                    # Инициализируем имя, которое пойдет в базу
                     final_name = raw_name
                     comp_id = None
 
-                    # Если парсим НЕ Ситилинк (например, Регард), пытаемся найти уже существующий ситилинковский аналог
                     if store != "citilink":
-                        # Получаем список уже существующих имен в этой категории из БД
                         existing_rows = conn.run(
                             "SELECT name FROM components WHERE category = :cat",
                             cat=category_name
                         )
                         existing_names = [r[0] for r in existing_rows]
-
-                        # Исправлено: вызываем правильное имя функции из matcher.py
                         matched_name = matcher.find_match(raw_name, existing_names)
                         if matched_name:
                             final_name = matched_name
 
-                    # 1. Запись/Обновление в components
                     res = conn.run(
                         """
                         INSERT INTO components (name, category, image_url)
                         VALUES (:name, :cat, :img)
                         ON CONFLICT (name) DO UPDATE
-                            SET category  = EXCLUDED.category,
-                                image_url = CASE WHEN components.image_url = '' THEN EXCLUDED.image_url ELSE components.image_url END,
+                            SET category   = EXCLUDED.category,
+                                image_url  = CASE
+                                    WHEN EXCLUDED.image_url = '' OR EXCLUDED.image_url IS NULL
+                                        THEN components.image_url
+                                    WHEN components.image_url IS NULL OR components.image_url = ''
+                                        THEN EXCLUDED.image_url
+                                    WHEN components.image_url NOT LIKE 'http%'
+                                        THEN EXCLUDED.image_url
+                                    ELSE components.image_url
+                                END,
                                 updated_at = now()
-                        RETURNING id
+                        RETURNING id, image_url
                         """,
-                        name=final_name, cat=category_name, img=item.get("imageUrl", "")
+                        name=final_name,
+                        cat=category_name,
+                        img=new_image_url if image_is_valid else "",
                     )
                     comp_id = res[0][0]
+                    stored_image = res[0][1] or ""
 
-                    # 2. Запись в component_prices (Ограничение UNIQUE теперь защитит от дублей)
+                    if image_is_valid and not _is_valid_image_url(stored_image):
+                        conn.run(
+                            """
+                            UPDATE components
+                               SET image_url  = :img,
+                                   updated_at = now()
+                             WHERE id = :cid
+                               AND (image_url IS NULL OR image_url = '' OR image_url NOT LIKE 'http%')
+                            """,
+                            img=new_image_url,
+                            cid=comp_id,
+                        )
+                        log.debug(
+                            "[БД] image_url принудительно обновлён для '%s': %s",
+                            final_name[:50], new_image_url[:80],
+                        )
+
                     conn.run(
                         """
                         INSERT INTO component_prices (component_id, store, price_rub, product_url)
@@ -258,26 +336,37 @@ def save_to_db(category_name: str, items_list: list, store: str = "citilink") ->
                                 product_url = EXCLUDED.product_url,
                                 updated_at  = now()
                         """,
-                        cid=comp_id, store=store, price=price_rub, url=item.get("productUrl", "")
+                        cid=comp_id,
+                        store=store,
+                        price=price_rub,
+                        url=item.get("productUrl", ""),
                     )
 
-                    # 3. Запись в component_specs
                     conn.run(
                         """
                         INSERT INTO component_specs (component_id, store, specs)
                         VALUES (:cid, :store, :specs)
                         ON CONFLICT (component_id, store) DO UPDATE
-                            SET specs = EXCLUDED.specs, updated_at = now()
+                            SET specs      = EXCLUDED.specs,
+                                updated_at = now()
                         """,
-                        cid=comp_id, store=store, specs=specs_json
+                        cid=comp_id,
+                        store=store,
+                        specs=specs_json,
                     )
 
-                    # 4. Запись в component_compat
                     _upsert_component_compat(conn, comp_id, compat)
 
+                    log.debug(
+                        "[БД] %s '%s' image='%s'",
+                        store, final_name[:50], stored_image[:60] if stored_image else "(пусто)",
+                    )
+
                 except Exception as e:
-                    # Исправлено: убран несуществующий conn.host, добавлен полный вывод трейсбэка ошибки для удобства дебага
-                    log.error("Ошибка записи товара '%s' в БД: %s", raw_name, e, exc_info=True)
+                    log.error(
+                        "Ошибка записи товара '%s' в БД: %s",
+                        raw_name, e, exc_info=True,
+                    )
 
             saved_count += 1
 
@@ -292,11 +381,6 @@ def save_to_db(category_name: str, items_list: list, store: str = "citilink") ->
 
     return saved_count
 
-
-# ══════════════════════════════════════════════════════════════
-#  ЗАГРУЗКА В КЭШ
-# ══════════════════════════════════════════════════════════════
-
 def load_all_from_db() -> dict:
     conns = get_connections()
     if not conns:
@@ -308,10 +392,12 @@ def load_all_from_db() -> dict:
         rows = conn.run("""
             SELECT
                 c.id, c.name, c.category, c.image_url,
-                cp_cl.price_rub, cp_cl.product_url,
-                cp_rg.price_rub, cp_rg.product_url,
+                cp_cl.price_rub,  cp_cl.product_url,
+                cp_rg.price_rub,  cp_rg.product_url,
                 cp_dns.price_rub, cp_dns.product_url,
-                cs_cl.specs, cs_rg.specs, cs_dns.specs,
+                cs_cl.specs  AS specs_citilink,
+                cs_rg.specs  AS specs_regard,
+                cs_dns.specs AS specs_dns,
                 cc.socket, cc.chipset, cc.ram_type, cc.ram_slots,
                 cc.ram_max_freq_mhz, cc.ram_height_mm, cc.ram_capacity_gb,
                 cc.tdp_w, cc.cpu_power_pin, cc.max_tdp_w, cc.cooler_height_mm,
@@ -345,7 +431,9 @@ def load_all_from_db() -> dict:
         for row in rows:
             (
                 cid, name, category, image_url,
-                price_cl, url_cl, price_rg, url_rg, price_dns, url_dns,
+                price_cl,  url_cl,
+                price_rg,  url_rg,
+                price_dns, url_dns,
                 specs_cl_raw, specs_rg_raw, specs_dns_raw,
                 socket, chipset, ram_type, ram_slots, ram_max_freq,
                 ram_height, ram_cap, tdp, cpu_pin, max_tdp, cooler_h,
@@ -356,14 +444,15 @@ def load_all_from_db() -> dict:
                 ssd_iface, ssd_ff, ssd_gb,
             ) = row
 
-            price_cl_str = "{:,}".format(price_cl).replace(",", " ") + " руб" if price_cl else "---"
-            price_rg_str = "{:,}".format(price_rg).replace(",", " ") + " руб" if price_rg else "---"
+            price_cl_str  = "{:,}".format(price_cl).replace(",", " ")  + " руб" if price_cl  else "---"
+            price_rg_str  = "{:,}".format(price_rg).replace(",", " ")  + " руб" if price_rg  else "---"
             price_dns_str = "{:,}".format(price_dns).replace(",", " ") + " руб" if price_dns else "---"
 
-            specs_cl = _decode_specs(specs_cl_raw)
-            specs_rg = _decode_specs(specs_rg_raw)
+            specs_cl  = _decode_specs(specs_cl_raw)
+            specs_rg  = _decode_specs(specs_rg_raw)
             specs_dns = _decode_specs(specs_dns_raw)
-            specs_dict = {}
+
+            specs_dict: dict = {}
             for source_specs in (specs_cl, specs_rg, specs_dns):
                 specs_dict.update(source_specs)
 
@@ -374,36 +463,60 @@ def load_all_from_db() -> dict:
                 derived_compat = {}
 
             item = {
-                "id": cid, "name": name or "", "category": category or "",
+                "id":       cid,
+                "name":     name     or "",
+                "category": category or "",
                 "imageUrl": image_url or "",
-                "priceCitilink": price_cl_str, "productUrl": url_cl or "",
-                "priceRegard": price_rg_str, "productUrlRegard": url_rg or "",
-                "priceDNS": price_dns_str, "productUrlDNS": url_dns or "",
-                "specs": specs_dict,
+
+                "priceCitilink":    price_cl_str,
+                "productUrl":       url_cl  or "",
+                "priceRegard":      price_rg_str,
+                "productUrlRegard": url_rg  or "",
+                "priceDNS":         price_dns_str,
+                "productUrlDNS":    url_dns or "",
+
+                "specs":         specs_dict,
                 "specsCitilink": specs_cl,
-                "specsRegard": specs_rg,
-                "specsDNS": specs_dns,
-                "socket": socket or "---", "chipset": chipset or "---",
-                "ramType": ram_type or "---", "ramSlots": ram_slots or 0,
-                "ramMaxFreq": ram_max_freq or 0, "ramHeight": ram_height or 0,
-                "ramCapacity": ram_cap or 0, "tdp": tdp or 0,
-                "cpuPowerPin": cpu_pin or "---", "maxTdp": max_tdp or 0,
-                "coolerHeight": cooler_h or 0, "psuWattage": psu_w or 0,
-                "psuFormFactor": psu_ff or "---", "psuLength": psu_len or 0,
+                "specsRegard":   specs_rg,
+                "specsDNS":      specs_dns,
+
+                "socket":      socket    or "---",
+                "chipset":     chipset   or "---",
+                "ramType":     ram_type  or "---",
+                "ramSlots":    ram_slots or 0,
+                "ramMaxFreq":  ram_max_freq or 0,
+                "ramHeight":   ram_height   or 0,
+                "ramCapacity": ram_cap      or 0,
+                "tdp":         tdp          or 0,
+                "cpuPowerPin": cpu_pin or "---",
+                "maxTdp":      max_tdp or 0,
+                "coolerHeight": cooler_h or 0,
+                "psuWattage":   psu_w    or 0,
+                "psuFormFactor": psu_ff  or "---",
+                "psuLength":     psu_len or 0,
                 "psuEfficiency": psu_eff or "---",
-                "gpuPowerPin": gpu_pin or "---", "formFactor": ff or "---",
-                "pciVersion": pci_ver or "---", "m2Slots": m2_slots or 0,
-                "m2Types": list(m2_types) if m2_types else [],
-                "gpuChipset": gpu_chip or "---", "vram": vram or 0,
-                "gpuLength": gpu_len or 0, "gpuHeight": gpu_h or 0,
-                "gpuSlots": gpu_slots or 0, "gpuTdp": gpu_tdp or 0,
-                "gpuReqPsu": gpu_req or 0, "gpuPciVersion": gpu_pci or "---",
-                "maxGpuLength": max_gpu or 0,
-                "maxCpuCoolerHeight": max_cool or 0, "maxPsuLength": max_psu or 0,
-                "supportedMbFormats": list(mb_formats) if mb_formats else [],
-                "ssdInterface": ssd_iface or "---", "ssdFormFactor": ssd_ff or "---",
-                "ssdCapacityGb": ssd_gb or 0,
+                "gpuPowerPin":   gpu_pin or "---",
+                "formFactor":    ff      or "---",
+                "pciVersion":    pci_ver or "---",
+                "m2Slots":  m2_slots or 0,
+                "m2Types":  list(m2_types) if m2_types else [],
+                "gpuChipset":   gpu_chip or "---",
+                "vram":         vram     or 0,
+                "gpuLength":    gpu_len  or 0,
+                "gpuHeight":    gpu_h    or 0,
+                "gpuSlots":     gpu_slots or 0,
+                "gpuTdp":       gpu_tdp  or 0,
+                "gpuReqPsu":    gpu_req  or 0,
+                "gpuPciVersion": gpu_pci or "---",
+                "maxGpuLength":        max_gpu  or 0,
+                "maxCpuCoolerHeight":  max_cool or 0,
+                "maxPsuLength":        max_psu  or 0,
+                "supportedMbFormats":  list(mb_formats) if mb_formats else [],
+                "ssdInterface":   ssd_iface or "---",
+                "ssdFormFactor":  ssd_ff    or "---",
+                "ssdCapacityGb":  ssd_gb    or 0,
             }
+
             for key, value in derived_compat.items():
                 if _has_value(value) and not _has_value(item.get(key)):
                     item[key] = value
@@ -411,7 +524,10 @@ def load_all_from_db() -> dict:
             cache.setdefault(category, []).append(item)
 
         total = sum(len(v) for v in cache.values())
-        log.info("load_all_from_db: загружено %d товаров в %d категориях", total, len(cache))
+        log.info(
+            "load_all_from_db: загружено %d товаров в %d категориях",
+            total, len(cache),
+        )
         return cache
 
     except Exception as e:
@@ -424,19 +540,12 @@ def load_all_from_db() -> dict:
             pass
 
 
-# ══════════════════════════════════════════════════════════════
-#  ОБНОВЛЕНИЕ ЦЕНЫ REGARD
-# ══════════════════════════════════════════════════════════════
-
 def save_regard_price_to_db(
     component_name: str,
     price_str: str,
     product_url: str = "",
-    store: str = "regard"
+    store: str = "regard",
 ) -> bool:
-    """
-    Обновляет цену Регарда для существующего компонента.
-    """
     digits = "".join(filter(str.isdigit, str(price_str)))
     price_rub = int(digits) if digits else 0
 
@@ -450,7 +559,7 @@ def save_regard_price_to_db(
         try:
             res = conn.run(
                 "SELECT id FROM components WHERE name = :name LIMIT 1",
-                name=component_name
+                name=component_name,
             )
             if not res:
                 log.warning("Компонент '%s' не найден", component_name)
@@ -462,11 +571,14 @@ def save_regard_price_to_db(
                 INSERT INTO component_prices (component_id, store, price_rub, product_url)
                 VALUES (:cid, :store, :price, :url)
                 ON CONFLICT (component_id, store) DO UPDATE
-                    SET price_rub = EXCLUDED.price_rub,
+                    SET price_rub   = EXCLUDED.price_rub,
                         product_url = EXCLUDED.product_url,
-                        updated_at = now()
+                        updated_at  = now()
                 """,
-                cid=component_id, store=store, price=price_rub, url=product_url
+                cid=component_id,
+                store=store,
+                price=price_rub,
+                url=product_url,
             )
             log.info("[БД] Цена %s для '%s': %d руб.", store, component_name, price_rub)
             success = True
@@ -482,19 +594,11 @@ def save_regard_price_to_db(
 
     return success
 
-
-# ══════════════════════════════════════════════════════════════
-#  ОБНОВЛЕНИЕ SPECS REGARD
-# ══════════════════════════════════════════════════════════════
-
 def save_regard_specs_to_db(
     component_name: str,
     specs: dict,
-    store: str = "regard"
+    store: str = "regard",
 ) -> bool:
-    """
-    Обновляет характеристики Регарда для существующего компонента.
-    """
     if not specs:
         return False
 
@@ -508,7 +612,7 @@ def save_regard_specs_to_db(
         try:
             res = conn.run(
                 "SELECT id FROM components WHERE name = :name LIMIT 1",
-                name=component_name
+                name=component_name,
             )
             if not res:
                 log.warning("Компонент '%s' не найден", component_name)
@@ -520,9 +624,12 @@ def save_regard_specs_to_db(
                 INSERT INTO component_specs (component_id, store, specs)
                 VALUES (:cid, :store, :specs)
                 ON CONFLICT (component_id, store) DO UPDATE
-                    SET specs = EXCLUDED.specs, updated_at = now()
+                    SET specs      = EXCLUDED.specs,
+                        updated_at = now()
                 """,
-                cid=component_id, store=store, specs=specs_json
+                cid=component_id,
+                store=store,
+                specs=specs_json,
             )
             log.info("[БД] Specs %s для '%s': %d полей", store, component_name, len(specs))
             success = True
@@ -545,14 +652,11 @@ def save_store_specs_and_compat_to_db(
     item: dict,
     store: str,
 ) -> bool:
-    """
-    Обновляет specs магазина и component_compat для уже существующего товара.
-    Нужно для сматченных DNS/Regard товаров: без этого валидатор после рестарта
-    видит цену и raw specs, но не видит готовые поля совместимости.
-    """
     specs = item.get("specs") or {}
     compat = _extract_compat_fields(item)
     specs_json = json.dumps(specs, ensure_ascii=False)
+
+    new_image_url = item.get("imageUrl") or ""
 
     conns = get_connections()
     if not conns:
@@ -562,36 +666,57 @@ def save_store_specs_and_compat_to_db(
     for conn in conns:
         try:
             res = conn.run(
-                "SELECT id FROM components WHERE name = :name LIMIT 1",
-                name=component_name
+                "SELECT id, image_url FROM components WHERE name = :name LIMIT 1",
+                name=component_name,
             )
             if not res:
                 log.warning("Компонент '%s' не найден", component_name)
                 continue
 
             component_id = res[0][0]
+            stored_image = res[0][1] or ""
+
+            if _is_valid_image_url(new_image_url) and not _is_valid_image_url(stored_image):
+                conn.run(
+                    """
+                    UPDATE components
+                       SET image_url  = :img,
+                           updated_at = now()
+                     WHERE id = :cid
+                    """,
+                    img=new_image_url,
+                    cid=component_id,
+                )
+                log.debug(
+                    "[БД] image_url обновлён для '%s' (%s): %s",
+                    component_name[:50], store, new_image_url[:80],
+                )
+
             if specs:
                 conn.run(
                     """
                     INSERT INTO component_specs (component_id, store, specs)
                     VALUES (:cid, :store, :specs)
                     ON CONFLICT (component_id, store) DO UPDATE
-                        SET specs = EXCLUDED.specs, updated_at = now()
+                        SET specs      = EXCLUDED.specs,
+                            updated_at = now()
                     """,
-                    cid=component_id, store=store, specs=specs_json
+                    cid=component_id,
+                    store=store,
+                    specs=specs_json,
                 )
 
             _upsert_component_compat(conn, component_id, compat)
             log.info(
                 "[БД] Specs + compat %s для '%s' (%s): %d полей",
-                store, component_name, category_name, len(specs)
+                store, component_name, category_name, len(specs),
             )
             success = True
 
         except Exception as e:
             log.error(
                 "save_store_specs_and_compat_to_db: Ошибка для '%s': %s",
-                component_name, e, exc_info=True
+                component_name, e, exc_info=True,
             )
 
     for c in conns:
@@ -601,63 +726,3 @@ def save_store_specs_and_compat_to_db(
             pass
 
     return success
-
-
-# ══════════════════════════════════════════════════════════════
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ══════════════════════════════════════════════════════════════
-
-def _nn(val, max_len: int | None = None) -> Optional[str]:
-    if not val or val == "---":
-        return None
-    text = str(val)
-    return text[:max_len] if max_len else text
-
-def _ni(val) -> Optional[int]:
-    try:
-        v = int(float(str(val)))
-        return v if v > 0 else None
-    except Exception:
-        return None
-
-def _na(val) -> Optional[list]:
-    return list(val) if val and isinstance(val, (list, tuple)) else None
-
-def _extract_compat_fields(item: dict) -> dict:
-    return {
-        "socket": item.get("socket"),
-        "chipset": item.get("chipset"),
-        "ramType": item.get("ramType"),
-        "ramSlots": item.get("ramSlots"),
-        "ramMaxFreq": item.get("ramMaxFreq"),
-        "ramHeight": item.get("ramHeight"),
-        "ramCapacity": item.get("ramCapacity"),
-        "tdp": item.get("tdp"),
-        "cpuPowerPin": item.get("cpuPowerPin"),
-        "maxTdp": item.get("maxTdp"),
-        "coolerHeight": item.get("coolerHeight"),
-        "psuWattage": item.get("psuWattage"),
-        "psuFormFactor": item.get("psuFormFactor"),
-        "psuLength": item.get("psuLength"),
-        "psuEfficiency": item.get("psuEfficiency") or item.get("psuCertification"),
-        "gpuPowerPin": item.get("gpuPowerPin"),
-        "formFactor": item.get("formFactor"),
-        "pciVersion": item.get("pciVersion"),
-        "m2Slots": item.get("m2Slots"),
-        "m2Types": item.get("m2Types"),
-        "gpuChipset": item.get("gpuChipset"),
-        "vram": item.get("vram"),
-        "gpuLength": item.get("gpuLength"),
-        "gpuHeight": item.get("gpuHeight"),
-        "gpuSlots": item.get("gpuSlots"),
-        "gpuTdp": item.get("gpuTdp"),
-        "gpuReqPsu": item.get("gpuReqPsu"),
-        "gpuPciVersion": item.get("gpuPciVersion"),
-        "maxGpuLength": item.get("maxGpuLength"),
-        "maxCpuCoolerHeight": item.get("maxCpuCoolerHeight"),
-        "maxPsuLength": item.get("maxPsuLength"),
-        "supportedMbFormats": item.get("supportedMbFormats"),
-        "ssdInterface": item.get("ssdInterface"),
-        "ssdFormFactor": item.get("ssdFormFactor"),
-        "ssdCapacityGb": item.get("ssdCapacityGb"),
-    }

@@ -1,9 +1,12 @@
 """
-build_validator.py
-Глубокий аудит совместимости сборки ПК.
+© Жиляков Д.Э., 2026. Все права защищены.
 """
 
-from __future__ import annotations
+"""
+build_validator.py
+Аудит совместимости сборки ПК.
+"""
+
 import re
 import logging
 from dataclasses import dataclass, field, asdict
@@ -12,9 +15,6 @@ from typing import Any, Optional
 log = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  КОНСТАНТЫ
-# ═══════════════════════════════════════════════════════════════════════════
 
 SOCKET_CHIPSET_MAP: dict[str, list[str]] = {
     "AM5":     ["X870E", "X870", "X670E", "X670", "B850", "B650E", "B650", "A620"],
@@ -94,8 +94,19 @@ IF_THRESHOLD_AM5 = 6000
 
 GPU_DUAL_CABLE_TDP_THRESHOLD = 250
 
-IGPU_AMD_PATTERN   = r'ryzen.+\d{4,5}g\b'
-IGPU_INTEL_EXCLUDE = r'\d{4,6}[kf]*f\b'
+IGPU_AMD_PATTERN    = r'ryzen.+\d{4,5}g\b'
+IGPU_INTEL_EXCLUDE  = r'\d{4,6}[kf]*f\b'
+IGPU_AMD_AM5_SOCKET = "AM5"
+
+IGPU_PRESENT_MARKERS: set[str] = {
+    "есть", "да", "yes", "true", "1",
+    "amd radeon graphics", "radeon graphics",
+    "intel uhd graphics", "intel iris xe",
+    "intel hd graphics",
+}
+IGPU_ABSENT_MARKERS: set[str] = {
+    "нет", "no", "false", "0", "отсутствует", "none", "-", "---",
+}
 
 GPU_CLASS_BY_TDP: dict[int, str] = {
     50:  "low-end",
@@ -119,13 +130,14 @@ XMP_THRESHOLD_DDR5 = 4800
 VRAM_MIN_1080P = 8
 VRAM_MIN_4K    = 12
 
-# Маркеры «GPU не требует доп. питания»
 NO_POWER_MARKERS = {"без питания", "no power", "нет", "none", "---", ""}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ТИПЫ РЕЗУЛЬТАТОВ
-# ═══════════════════════════════════════════════════════════════════════════
+MULTI_PCIE_SLOT_CHIPSETS = {
+    "X870E", "X670E", "X870", "X670",
+    "Z890", "Z790", "Z690",
+    "X570", "X470", "X370",
+    "Z590", "Z490", "Z390", "Z370",
+}
 
 @dataclass
 class Issue:
@@ -159,10 +171,6 @@ class ValidationResult:
             "summary":  self.summary,
         }
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  УТИЛИТЫ
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _g(component: dict | None, key: str, default=None):
     if not component:
@@ -219,7 +227,6 @@ def _derive_gpu_pin_from_specs(component: dict | None) -> str:
 
     return ""
 
-
 def _derive_psu_length_from_specs(component: dict | None) -> int:
     for raw_key, raw_value in _iter_component_specs(component) or ():
         key = _lookup_text(raw_key)
@@ -240,29 +247,12 @@ def _derive_psu_length_from_specs(component: dict | None) -> int:
 
     return 0
 
-
 def _normalize_gpu_pin(pin_str: str) -> str:
-    """
-    Нормализует строку разъёма питания GPU к единому формату.
-
-    Реальные строки из парсера Ситилинк:
-        "2x(6+2) pin"                    → "8+8 pin"
-        "1x(6+2) pin"                    → "8 pin"
-        "питание видеокарты 2x(6+2) pin" → "8+8 pin"
-        "2x8 pin"                        → "8+8 pin"
-        "3x8 pin"                        → "8+8+8 pin"
-        "8 pin"                          → "8 pin"
-        "6+2 pin"                        → "8 pin"
-        "8+8 pin"                        → "8+8 pin"
-        "12VHPWR (16 pin)"               → "12vhpwr (16 pin)"
-        "без питания"                    → "без питания"
-    """
     if not pin_str:
         return ""
 
     s = pin_str.lower().strip()
 
-    # Убираем мусорные слова
     for noise in (
         "питание видеокарты", "питание", "видеокарты",
         "рекомендовано", "разъём", "разъем", "коннектор", "connector",
@@ -270,66 +260,44 @@ def _normalize_gpu_pin(pin_str: str) -> str:
         s = s.replace(noise, " ")
     s = re.sub(r'\s+', ' ', s).strip()
 
-    # Маркеры "без питания" — возвращаем как есть
     if s in NO_POWER_MARKERS or not s:
         return s
 
-    # 12VHPWR / 16-pin
     if "12vhpwr" in s or "16-pin" in s or re.search(r'16\s*pin', s):
         return "12vhpwr (16 pin)"
 
-    # Формат "Nx(A+B)" → суммируем пины, разворачиваем по количеству
-    # Пример: "2x(6+2)" → count=2, a=6, b=2 → total_per=8 → "8+8 pin"
     m = re.match(r'(\d+)\s*[xх×*]\s*\((\d+)\+(\d+)\)', s)
     if m:
         count     = int(m.group(1))
         total_per = int(m.group(2)) + int(m.group(3))
         return "+".join([str(total_per)] * count) + " pin"
 
-    # Формат "Nx(A)" → "A+A+... pin"
     m = re.match(r'(\d+)\s*[xх×*]\s*\((\d+)\)', s)
     if m:
         count = int(m.group(1))
         a     = int(m.group(2))
         return "+".join([str(a)] * count) + " pin"
 
-    # Формат "NxA" без скобок → "A+A+... pin"
-    # Пример: "2x8" → "8+8 pin", "3x6" → "6+6+6 pin"
     m = re.match(r'(\d+)\s*[xх×*]\s*(\d+)', s)
     if m:
         count = int(m.group(1))
         a     = int(m.group(2))
         return "+".join([str(a)] * count) + " pin"
 
-    # Формат "A+B" где результат — сумма (пр: "6+2" = 8-pin разъём)
-    # Но только если это ОДИН разъём (нет умножителя)
     m = re.match(r'^(\d+)\+(\d+)$', s.replace(" pin", "").replace("pin", "").strip())
     if m:
         total = int(m.group(1)) + int(m.group(2))
         return f"{total} pin"
 
-    # Просто число
     m = re.match(r'^(\d+)$', s.replace(" pin", "").replace("pin", "").strip())
     if m:
         return f"{m.group(1)} pin"
 
-    # Убираем слово "pin" для финального возврата
     result = s.replace("pin", "").strip()
     return result if result else s
 
 
 def _gpu_pin_units(pin_str: str) -> int:
-    """
-    Возвращает суммарное количество «единиц мощности» разъёма GPU.
-    Сначала нормализует строку, потом суммирует все пины.
-    Единица ≈ 75 Вт (один 6-pin эквивалент).
-
-    Примеры:
-        "8 pin"      → 1 (≈75 Вт от разъёма, но это 8-pin)
-        "8+8 pin"    → 2
-        "8+8+8 pin"  → 3
-        "12vhpwr"    → 8 (600 Вт)
-    """
     if not pin_str:
         return 0
 
@@ -342,8 +310,6 @@ def _gpu_pin_units(pin_str: str) -> int:
     if "12vhpwr" in low:
         return 8
 
-    # Считаем количество разъёмов после нормализации:
-    # "8+8 pin" → [8, 8] → 2 разъёма, "6+2 pin" → "8 pin" → 1 разъём.
     numbers = re.findall(r'\d+', low.replace("pin", ""))
     if numbers:
         return len(numbers)
@@ -403,9 +369,171 @@ def _get_mb_sata_ports(mb: dict | None) -> int:
     return SATA_PORTS_BY_FF.get(ff, 4)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ОСНОВНОЙ КЛАСС ВАЛИДАТОРА
-# ═══════════════════════════════════════════════════════════════════════════
+def _get_mb_pcie_x16_slots(mb: dict | None) -> int:
+    if not mb:
+        return 1
+
+    direct = _int(_g(mb, "pcieX16Slots"), 0)
+    if direct > 0:
+        return direct
+
+    PCIE_KEY_FRAGMENTS = (
+        "слоты pci",
+        "слот pci",
+        "pcie слот",
+        "слоты расширения",
+        "expansion slot",
+        "pci express slot",
+        "разъемы pci",
+        "слоты",
+    )
+
+    max_found = 0
+
+    for raw_key, raw_value in _iter_component_specs(mb):
+        key_norm   = _lookup_text(raw_key)
+        value_norm = _lookup_text(str(raw_value or ""))
+
+        key_relevant = any(frag in key_norm for frag in PCIE_KEY_FRAGMENTS)
+        if not key_relevant:
+            continue
+
+        matches1 = re.findall(r'x16\s*[xх×]\s*(\d+)', value_norm)
+        count1 = sum(int(m) for m in matches1 if m)
+
+        matches2 = re.findall(r'(\d+)\s*[xх×]\s*(?:pcie?|pci-e)[^\n,]*?x16', value_norm)
+        count2 = sum(int(m) for m in matches2 if m)
+
+        total = count1 + count2
+
+        if total > max_found:
+            max_found = total
+
+        if max_found == 0 and "x16" in value_norm:
+            mentions = len(re.findall(r'\bx16\b', value_norm))
+            if mentions > max_found:
+                max_found = mentions
+
+    if max_found > 0:
+        log.debug("_get_mb_pcie_x16_slots: найдено %d слотов x16 из specs", max_found)
+        return max_found
+
+    chipset = _g(mb, "chipset", "").upper()
+    if chipset in MULTI_PCIE_SLOT_CHIPSETS:
+        log.debug(
+            "_get_mb_pcie_x16_slots: chipset %s → assume 2 слота x16",
+            chipset,
+        )
+        return 2
+    return 1
+
+
+def _count_ram_modules(stick: dict | None) -> int:
+    if not stick:
+        return 1
+
+    for raw_key, raw_value in _iter_component_specs(stick):
+        key = _lookup_text(raw_key)
+        if any(kw in key for kw in (
+            "количество модул",
+            "кол-во модул",
+            "modules in kit",
+            "number of modules",
+            "модулей в комплект",
+        )):
+            n = _int(raw_value, 0)
+            if n > 0:
+                return n
+
+    name = _lookup_text(stick.get("name") or "")
+
+    m = re.search(r'\b(\d+)\s*[xх×*]\s*\d+\s*(?:gb|гб)\b', name)
+    if m:
+        n = int(m.group(1))
+        if 1 < n <= 8:
+            return n
+
+    m = re.search(r'\b\d+\s*(?:gb|гб)\s*[xх×*]\s*(\d+)\b', name)
+    if m:
+        n = int(m.group(1))
+        if 1 < n <= 8:
+            return n
+
+    m = re.search(r'\b(\d+)\s*(?:шт|pcs|pieces|pack)\b', name)
+    if m:
+        n = int(m.group(1))
+        if 1 < n <= 8:
+            return n
+
+    return 1
+
+
+def _mb_supports_nvme(mb: dict | None) -> bool:
+    if not mb:
+        return False
+
+    m2_types = _g(mb, "m2Types", [])
+    if m2_types and "NVMe" in m2_types:
+        return True
+
+    NVME_VALUE_MARKERS = (
+        "nvme",
+        "nvm express",
+        "pci-e",
+        "pcie",
+        "pci express",
+    )
+
+    M2_KEY_FRAGMENTS = (
+        "тип слот",
+        "слот m.2",
+        "m.2",
+        "поддержка nvme",
+        "поддерживаемые технологии",
+        "nvme",
+        "nvm",
+        "интерфейс m.2",
+        "interface m.2",
+        "supported technologies",
+        "накопител",
+    )
+
+    for raw_key, raw_value in _iter_component_specs(mb):
+        key_norm   = _lookup_text(raw_key)
+        value_norm = _lookup_text(str(raw_value or ""))
+
+        key_relevant   = any(frag in key_norm   for frag in M2_KEY_FRAGMENTS)
+        value_has_nvme = any(marker in value_norm for marker in NVME_VALUE_MARKERS)
+
+        if key_relevant and value_has_nvme:
+            log.debug(
+                "_mb_supports_nvme: '%s'='%s' → NVMe поддерживается",
+                raw_key, raw_value,
+            )
+            return True
+
+        if "nvme" in key_norm and value_norm not in IGPU_ABSENT_MARKERS:
+            log.debug(
+                "_mb_supports_nvme: ключ '%s' содержит nvme, значение '%s' → True",
+                raw_key, raw_value,
+            )
+            return True
+
+    chipset = _g(mb, "chipset", "").upper()
+    if chipset and chipset in M2_SLOTS_BY_CHIPSET:
+        slots_count = M2_SLOTS_BY_CHIPSET.get(chipset, 0)
+        if slots_count > 0:
+            log.debug(
+                "_mb_supports_nvme: chipset %s (%d M.2 слотов) → NVMe assumed",
+                chipset, slots_count,
+            )
+            return True
+
+    mb_name = _lookup_text(mb.get("name") or "")
+    if any(x in mb_name for x in ("nvme", "m.2", "pcie")):
+        return True
+
+    return False
 
 class BuildValidator:
 
@@ -444,10 +572,6 @@ class BuildValidator:
 
         self.result = ValidationResult()
 
-    # ─────────────────────────────────────────────────────────────────────
-    #  ЗАПУСК ВСЕХ ПРОВЕРОК
-    # ─────────────────────────────────────────────────────────────────────
-
     def validate(self) -> ValidationResult:
         self.check_socket_compatibility()
         self.check_ram_type()
@@ -484,7 +608,6 @@ class BuildValidator:
         self.check_usb_c_front_panel()
         self.check_argb_rgb_headers()
         self.check_ram_population_order()
-        self.check_ecc_ram_compatibility()
 
         self.check_ram_mixing()
         self.check_multi_gpu()
@@ -493,9 +616,6 @@ class BuildValidator:
         self._build_summary()
         return self.result
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  1. СОКЕТ
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_socket_compatibility(self):
         cpu_socket    = _g(self.cpu,    "socket")
@@ -528,10 +648,6 @@ class BuildValidator:
                     field="cooler"
                 ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  2. ТИП ОЗУ
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_ram_type(self):
         mb_ddr = _g(self.mb, "ramType")
         if not mb_ddr:
@@ -563,31 +679,28 @@ class BuildValidator:
                 field="cpu/mb"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  3. СЛОТЫ ОЗУ
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_ram_slots(self):
         if not self.ram_sticks:
             return
 
         mb_slots = _get_mb_ram_slots(self.mb)
-        n        = len(self.ram_sticks)
+        n = len(self.ram_sticks)
+        total_physical = sum(_count_ram_modules(s) for s in self.ram_sticks)
 
-        if mb_slots > 0 and n > mb_slots:
+        if mb_slots > 0 and total_physical > mb_slots:
             self.result.critical.append(Issue(
                 code="RAM_SLOTS_OVERFLOW",
-                title=f"Не хватает слотов ОЗУ: выбрано {n}, на плате {mb_slots}",
+                title=f"Не хватает слотов ОЗУ: {total_physical} модулей, на плате {mb_slots}",
                 detail=(
-                    f"Вы добавили {n} модулей памяти, "
+                    f"Суммарно в сборке {total_physical} физических модулей памяти "
+                    f"({n} {'позиция' if n == 1 else 'позиции' if n < 5 else 'позиций'} в сборке), "
                     f"но материнская плата имеет только {mb_slots} слота. "
-                    f"Физически невозможно установить все планки. "
                     f"Уберите лишние или выберите плату с большим числом слотов."
                 ),
                 field="mb/ram"
             ))
 
-        if n == 1 and mb_slots >= 2:
+        if total_physical == 1 and mb_slots >= 2:
             self.result.advisory.append(Issue(
                 code="SINGLE_CHANNEL",
                 title="Включён одноканальный режим памяти",
@@ -598,7 +711,7 @@ class BuildValidator:
                 ),
                 field="ram"
             ))
-        elif n == 3 and mb_slots == 4:
+        elif total_physical == 3 and mb_slots == 4:
             self.result.advisory.append(Issue(
                 code="RAM_ODD_COUNT",
                 title="3 планки ОЗУ в 4-слотовой плате — нестандартная конфигурация",
@@ -616,17 +729,13 @@ class BuildValidator:
             if stick_freq and mb_max_freq and stick_freq > mb_max_freq:
                 self.result.warning.append(Issue(
                     code="RAM_FREQ_THROTTLE",
-                    title=f"Модуль #{i+1} будет понижен по частоте",
+                    title=f"Модуль #{i + 1} будет понижен по частоте",
                     detail=(
                         f"Модуль поддерживает {stick_freq} МГц, "
                         f"но плата ограничена {mb_max_freq} МГц."
                     ),
                     field="ram"
                 ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  4. ФИЗИЧЕСКИЙ КОНФЛИКТ RAM / КУЛЕР
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_ram_cooler_clearance(self):
         if not self.cooler or not self.ram_sticks:
@@ -657,10 +766,6 @@ class BuildValidator:
                     field="ram/cooler"
                 ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  5. ЭНЕРГЕТИЧЕСКИЙ АУДИТ — ИСПРАВЛЕН (нормализация разъёмов GPU)
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_power_deep(self):
         cpu_tdp = _int(_g(self.cpu, "tdp"), 0)
         gpu_tdp = sum(_int(_g(g, "gpuTdp"), 0) for g in self.gpus)
@@ -670,7 +775,6 @@ class BuildValidator:
         total_tdp = cpu_tdp + gpu_tdp + SYSTEM_OVERHEAD_W
         rec_psu   = int(total_tdp * (1 + PSU_HEADROOM_PCT))
 
-        # ── Нет БП ────────────────────────────────────────────────────────
         if not psu_w and self.gpus:
             req = gpu_req or (gpu_tdp + 150)
             self.result.warning.append(Issue(
@@ -683,7 +787,6 @@ class BuildValidator:
                 field="psu"
             ))
 
-        # ── Мощность ──────────────────────────────────────────────────────
         if psu_w and total_tdp:
             if psu_w < total_tdp:
                 self.result.critical.append(Issue(
@@ -719,7 +822,6 @@ class BuildValidator:
                 field="psu"
             ))
 
-        # ── Питание CPU (EPS) ──────────────────────────────────────────────
         mb_cpu_pin  = _g(self.mb,  "cpuPowerPin", "---")
         psu_cpu_pin = _g(self.psu, "cpuPowerPin", "---")
         mb_amps     = CPU_PIN_AMPERAGE.get(mb_cpu_pin, 0)
@@ -747,183 +849,6 @@ class BuildValidator:
                     ),
                     field="psu"
                 ))
-        import re
-
-        def parse_pcie_pins(pin_string: str) -> dict:
-            """
-            Преобразует строку разъемов в словарь с их количеством.
-            Поддерживает префиксы (2x8 pin) и постфиксы (6+2 pin x2, 12VHPWR x1).
-            """
-            result = {'16pin': 0, '8pin': 0, '6pin': 0}
-            if not pin_string or not isinstance(pin_string, str) or pin_string.strip() in ('', '---', 'Нет', 'без питания'):
-                return result
-
-            s = pin_string.lower()
-
-            # --- 1. Обработка 16-pin / 12VHPWR ---
-            # Префикс: 2x16 pin, 1x12vhpwr
-            for m in re.finditer(r'(\d+)\s*[x×х]\s*(?:16|12vhpwr)', s):
-                result['16pin'] += int(m.group(1))
-                s = s.replace(m.group(0), '')
-            # Постфикс: 16 pin x2, 12vhpwr x1
-            for m in re.finditer(r'(?:16|12vhpwr)\s*(?:pin|пин|пинов|-pin)?\s*[x×х]\s*(\d+)', s):
-                result['16pin'] += int(m.group(1))
-                s = s.replace(m.group(0), '')
-            # Одиночные (без множителя)
-            count_16 = len(re.findall(r'(?:16\b|12vhpwr)', s))
-            result['16pin'] += count_16
-            s = re.sub(r'(?:16|12vhpwr)\s*(?:pin|пин|пинов|-pin)?', '', s)
-
-            # --- 2. Обработка 8-pin и (6+2)-pin ---
-            # Префикс: 2x8 pin, 3x(6+2)
-            for m in re.finditer(r'(\d+)\s*[x×х]\s*\(?(?:8|6\s*\+\s*2)\)?', s):
-                result['8pin'] += int(m.group(1))
-                s = s.replace(m.group(0), '')
-            # Постфикс: 8 pin x2, (6+2) pin x4
-            for m in re.finditer(r'\(?(?:8|6\s*\+\s*2)\)?\s*(?:pin|пин|пинов|-pin)?\s*[x×х]\s*(\d+)', s):
-                result['8pin'] += int(m.group(1))
-                s = s.replace(m.group(0), '')
-
-            # --- 3. Обработка 6-pin ---
-            # Префикс: 2x6 pin
-            for m in re.finditer(r'(\d+)\s*[x×х]\s*\(?6\)?(?![\s\+]*2)', s):
-                result['6pin'] += int(m.group(1))
-                s = s.replace(m.group(0), '')
-            # Постфикс: 6 pin x2
-            for m in re.finditer(r'\(?6\)?\s*(?:pin|пин|пинов|-pin)?\s*[x×х]\s*(\d+)', s):
-                result['6pin'] += int(m.group(1))
-                s = s.replace(m.group(0), '')
-
-            # --- 4. Одиночные вхождения (если написано просто "6+2 pin, 8 pin") ---
-            count_6_2 = len(re.findall(r'6\s*\+\s*2', s))
-            result['8pin'] += count_6_2
-            s = re.sub(r'6\s*\+\s*2', '', s)
-
-            count_8 = len(re.findall(r'\b8\b', s))
-            result['8pin'] += count_8
-
-            count_6 = len(re.findall(r'\b6\b', s))
-            result['6pin'] += count_6
-
-            return result
-
-        # ── Питание GPU — ИСПРАВЛЕНО: нормализация форматов ──────────────
-        # ── Питание GPU — ИСПРАВЛЕНО: нормализация форматов ──────────────
-        for gpu in self.gpus:
-            gpu_pin = _g(gpu, "gpuPowerPin", "") or ""
-            psu_gpu_pin = _g(self.psu, "gpuPowerPin", "") or ""
-            if psu_gpu_pin.lower().strip() in NO_POWER_MARKERS:
-                psu_gpu_pin_from_specs = _derive_gpu_pin_from_specs(self.psu)
-                if psu_gpu_pin_from_specs:
-                    psu_gpu_pin = psu_gpu_pin_from_specs
-
-            # GPU требует доп. питание?
-            gpu_needs_power = (
-                    gpu_pin.lower().strip() not in NO_POWER_MARKERS
-                    and bool(gpu_pin.strip())
-            )
-
-            if gpu_needs_power:
-                # ВОТ ЗДЕСЬ вызываем нашу новую функцию-парсер
-                gpu_pins = parse_pcie_pins(gpu_pin)
-                psu_pins = parse_pcie_pins(psu_gpu_pin)
-
-                log.debug(
-                    f"GPU разъемы: {gpu_pins} (из строки '{gpu_pin}') | "
-                    f"PSU разъемы: {psu_pins} (из строки '{psu_gpu_pin}')"
-                )
-
-                # 1. Проверка 16-pin (12VHPWR)
-                if gpu_pins['16pin'] > 0:
-                    missing_16 = gpu_pins['16pin'] - psu_pins['16pin']
-                    if missing_16 > 0:
-                        # 16-pin у БП нет, проверяем возможность подключения через переходник (нужно 3x 8-pin)
-                        needed_8pin_for_adapter = missing_16 * 3
-                        available_8pin = psu_pins['8pin'] - gpu_pins['8pin']
-
-                        if available_8pin >= needed_8pin_for_adapter:
-                            # Хватает кабелей для переходника, "резервируем" их, вычитая из доступных
-                            psu_pins['8pin'] -= needed_8pin_for_adapter
-                            self.result.warning.append(Issue(
-                                code="GPU_12VHPWR_ADAPTER",
-                                title="Видеокарта требует 12VHPWR, БП не имеет нативного разъёма",
-                                detail=(
-                                    f"GPU использует разъём 12VHPWR ({gpu_pin}). "
-                                    f"У БП его нет, поэтому потребуется комплектный переходник с 8-pin кабелей "
-                                    f"(используются 3 шт. 8-pin). Используйте только сертифицированные кабели."
-                                ),
-                                field="gpu/psu"
-                            ))
-                        else:
-                            self.result.critical.append(Issue(
-                                code="GPU_POWER_MISSING",
-                                title="БП не имеет разъёмов питания для GPU (12VHPWR)",
-                                detail=(
-                                    f"Видеокарте нужен {gpu_pin}. У БП нет нативного кабеля 12VHPWR, "
-                                    f"и недостаточно свободных 8-pin (6+2) кабелей для подключения через переходник "
-                                    f"(указано: '{psu_gpu_pin}')."
-                                ),
-                                field="psu"
-                            ))
-                    else:
-                        # 12VHPWR есть у БП нативно
-                        self.result.advisory.append(Issue(
-                            code="GPU_12VHPWR_REMINDER",
-                            title="12VHPWR: соблюдайте правила укладки кабеля",
-                            detail=(
-                                "Не сгибайте кабель под углом > 90° "
-                                "ближе 35 мм от разъёма (риск оплавления коннектора)."
-                            ),
-                            field="gpu"
-                        ))
-
-                # 2. Проверка 8-pin (6+2 pin)
-                missing_8 = gpu_pins['8pin'] - psu_pins['8pin']
-                if missing_8 > 0:
-                    self.result.critical.append(Issue(
-                        code="GPU_POWER_PIN_INSUFFICIENT",
-                        title="Блоку питания не хватает разъемов 8-pin (6+2)",
-                        detail=(
-                            f"GPU требует {gpu_pins['8pin']}x 8-pin (с учетом переходников 12VHPWR, если они нужны), "
-                            f"а БП предоставляет только {psu_pins['8pin']}x 8-pin (указано: '{psu_gpu_pin}')."
-                        ),
-                        field="gpu/psu"
-                    ))
-
-                # 3. Проверка 6-pin
-                missing_6 = gpu_pins['6pin'] - psu_pins['6pin']
-                if missing_6 > 0:
-                    # Оставшиеся 8-pin (6+2) кабели от БП можно использовать как 6-pin
-                    available_8_for_6 = psu_pins['8pin'] - gpu_pins['8pin']
-                    if available_8_for_6 < missing_6:
-                        self.result.critical.append(Issue(
-                            code="GPU_POWER_PIN_INSUFFICIENT",
-                            title="Блоку питания не хватает разъемов 6-pin",
-                            detail=(
-                                f"GPU требует {gpu_pins['6pin']}x 6-pin. У БП недостаточно 6-pin коннекторов, "
-                                f"и свободных комбинированных 6+2-pin для их замены тоже нет."
-                            ),
-                            field="gpu/psu"
-                        ))
-
-            else:
-                # GPU питается от слота PCIe (≤75 Вт, без доп. разъёма)
-                # _int — это, видимо, твоя внутренняя функция приведения типов
-                gpu_tdp_single = _int(_g(gpu, "gpuTdp"), 0)
-                if gpu_tdp_single > 0:
-                    self.result.advisory.append(Issue(
-                        code="GPU_SLOT_POWERED",
-                        title=f"GPU питается от слота PCIe (TDP {gpu_tdp_single} Вт)",
-                        detail=(
-                            "Видеокарта получает питание через слот PCIe x16 (лимит 75 Вт). "
-                            "Дополнительные кабели питания не требуются."
-                        ),
-                        field="gpu"
-                    ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  6. ЛИНИИ PCIe
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_pcie_lanes(self):
         cpu_socket = _g(self.cpu, "socket")
@@ -995,15 +920,12 @@ class BuildValidator:
             except (ValueError, TypeError):
                 pass
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  7. ФИЗИЧЕСКИЕ ГАБАРИТЫ GPU
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_gpu_physical(self):
         if not self.gpus or not self.case:
             return
 
         max_gpu_len = _int(_g(self.case, "maxGpuLength"), 0)
+        triple_slot_reported = False
 
         for gpu in self.gpus:
             gpu_len   = _int(_g(gpu, "gpuLength"), 0)
@@ -1034,20 +956,26 @@ class BuildValidator:
                         field="gpu/case"
                     ))
 
-            if gpu_slots == 3:
+            if gpu_slots == 3 and not triple_slot_reported:
+                triple_slot_reported = True
+                triple_count = sum(
+                    1 for g in self.gpus if _int(_g(g, "gpuSlots"), 0) == 3
+                )
+                slots_needed = triple_count * 3
                 self.result.advisory.append(Issue(
                     code="GPU_TRIPLE_SLOT",
-                    title=f"Трёхслотовая GPU '{gpu_name}' — проверьте свободные слоты",
+                    title=(
+                        f"Трёхслотовая GPU — проверьте свободные слоты в корпусе"
+                        if triple_count == 1 else
+                        f"{triple_count} трёхслотовые GPU — проверьте свободные слоты"
+                    ),
                     detail=(
-                        "GPU занимает 3 слота расширения. "
-                        "Убедитесь в наличии 3 смежных свободных заглушек в корпусе."
+                        f"{triple_count} × 3-слотовая GPU занимает суммарно "
+                        f"{slots_needed} слота расширения. "
+                        f"Убедитесь в наличии достаточного числа свободных заглушек в корпусе."
                     ),
                     field="gpu/case"
                 ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  8. КУЛЕР vs CPU (TDP)
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_cooler_vs_cpu(self):
         cpu_tdp    = _int(_g(self.cpu,    "tdp"), 0)
@@ -1078,10 +1006,6 @@ class BuildValidator:
                 field="cooler"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  9. КУЛЕР vs КОРПУС (высота)
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_cooler_vs_case(self):
         cooler_h = _int(_g(self.cooler, "coolerHeight"), 0)
         case_max = _int(_g(self.case,   "maxCpuCoolerHeight"), 0)
@@ -1110,10 +1034,6 @@ class BuildValidator:
                 ),
                 field="cooler/case"
             ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  10. ФОРМ-ФАКТОР КОРПУСА vs MB
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_case_form_factor(self):
         mb_ff     = _g(self.mb,   "formFactor")
@@ -1147,10 +1067,6 @@ class BuildValidator:
                 field="mb/case"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  11. ФОРМ-ФАКТОР БП vs КОРПУС
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_psu_form_factor(self):
         psu_ff  = _g(self.psu,  "psuFormFactor")
         case_ff = _g(self.case, "formFactor")
@@ -1158,8 +1074,8 @@ class BuildValidator:
         if not psu_ff or not case_ff:
             return
 
-        psu_len      = _int(_g(self.psu,  "psuLength"), 0)
-        case_psu_max = _int(_g(self.case, "maxPsuLength"), 0)
+        psu_len         = _int(_g(self.psu,  "psuLength"), 0)
+        case_psu_max    = _int(_g(self.case, "maxPsuLength"), 0)
         derived_psu_len = _derive_psu_length_from_specs(self.psu)
         if derived_psu_len and (
             not psu_len
@@ -1186,10 +1102,6 @@ class BuildValidator:
                 detail=f"Длина БП: {psu_len} мм, максимум: {case_psu_max} мм.",
                 field="psu/case"
             ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  12. BIOS FLASHBACK
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_bios_flashback(self):
         if not self.cpu or not self.mb:
@@ -1235,16 +1147,12 @@ class BuildValidator:
                     field="mb"
                 ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  13. SSD vs СЛОТЫ M.2
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_ssd_slot_availability(self):
         if not self.ssds or not self.mb:
             return
 
-        mb_m2_cnt   = _get_mb_m2_slots(self.mb)
-        mb_m2_types = _g(self.mb, "m2Types", [])
+        mb_m2_cnt        = _get_mb_m2_slots(self.mb)
+        mb_nvme_supported = _mb_supports_nvme(self.mb)
 
         for ssd in self.ssds:
             ssd_iface = _g(ssd, "ssdInterface", "")
@@ -1260,7 +1168,7 @@ class BuildValidator:
                     field="ssd/mb"
                 ))
 
-            if ssd_iface == "NVMe" and mb_m2_types and "NVMe" not in mb_m2_types:
+            if ssd_iface == "NVMe" and mb_m2_cnt > 0 and not mb_nvme_supported:
                 self.result.critical.append(Issue(
                     code="M2_NVME_UNSUPPORTED",
                     title="Слот M.2 на плате не поддерживает NVMe",
@@ -1271,52 +1179,159 @@ class BuildValidator:
                     field="ssd/mb"
                 ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  14. ИНТЕГРИРОВАННАЯ ГРАФИКА
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_igpu(self):
         if self.gpus:
             return
         if not self.cpu:
             return
 
-        cpu_name = (self.cpu.get("name") or "").lower()
-        has_igpu = False
+        cpu_name   = (self.cpu.get("name") or "").strip()
+        cpu_name_l = cpu_name.lower()
+        cpu_socket = _g(self.cpu, "socket", "")
 
-        if any(x in cpu_name for x in ("intel", "core i", "core ultra", "pentium", "celeron")):
-            if not re.search(IGPU_INTEL_EXCLUDE, cpu_name, re.I):
-                has_igpu = True
-        elif any(x in cpu_name for x in ("ryzen", "amd")):
-            if re.search(IGPU_AMD_PATTERN, cpu_name, re.I):
-                has_igpu = True
+        igpu_from_specs = self._detect_igpu_from_specs()
+        if igpu_from_specs is True:
+            self._add_igpu_advisory(cpu_name)
+            return
+        if igpu_from_specs is False:
+            self._add_no_igpu_critical(cpu_name)
+            return
 
-        if not has_igpu:
-            self.result.critical.append(Issue(
-                code="NO_GPU_NO_IGPU",
-                title="Система не выдаст изображение — нет GPU и нет iGPU в CPU",
-                detail=(
-                    "В сборке нет дискретной видеокарты, а выбранный CPU "
-                    "не имеет встроенной графики. "
-                    "Добавьте дискретную GPU или замените CPU на модель с iGPU."
-                ),
-                field="gpu/cpu"
-            ))
-        else:
+        has_igpu_field = self.cpu.get("hasIgpu")
+        if has_igpu_field is True:
+            self._add_igpu_advisory(cpu_name)
+            return
+        if has_igpu_field is False:
+            self._add_no_igpu_critical(cpu_name)
+            return
+
+        if cpu_socket == IGPU_AMD_AM5_SOCKET:
+            is_ryzen_am5 = any(
+                x in cpu_name_l
+                for x in ("ryzen", "ryzen 3", "ryzen 5", "ryzen 7", "ryzen 9")
+            )
+            if is_ryzen_am5:
+                log.debug(
+                    "check_igpu: AM5 CPU '%s' → iGPU есть (Radeon Graphics 2CU)",
+                    cpu_name
+                )
+                self._add_igpu_advisory(cpu_name)
+                return
+
+        has_igpu = self._detect_igpu_by_name(cpu_name_l)
+
+        if has_igpu is None:
+            log.warning(
+                "check_igpu: не удалось определить iGPU для '%s' (socket=%s)",
+                cpu_name, cpu_socket
+            )
             self.result.advisory.append(Issue(
-                code="IGPU_ONLY_MODE",
-                title="Работа на встроенной графике CPU — производительность ограничена",
+                code="IGPU_UNKNOWN",
+                title="Не удалось определить наличие встроенной графики",
                 detail=(
-                    "Дискретная видеокарта не выбрана. "
-                    "Система будет использовать iGPU. "
-                    "Убедитесь, что в BIOS включён видеовыход (iGPU / Auto)."
+                    f"Для CPU «{cpu_name}» не удалось автоматически определить "
+                    f"наличие iGPU. Если дискретной GPU нет — проверьте "
+                    f"спецификацию процессора вручную перед сборкой."
                 ),
                 field="cpu"
             ))
+            return
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  15. ОБЩИЙ ОБЪЁМ ОЗУ
-    # ═══════════════════════════════════════════════════════════════════════
+        if has_igpu:
+            self._add_igpu_advisory(cpu_name)
+        else:
+            self._add_no_igpu_critical(cpu_name)
+
+    def _detect_igpu_from_specs(self) -> bool | None:
+        IGPU_SPEC_KEY_FRAGMENTS = (
+            "интегрированное графическое ядро",
+            "встроенная графика",
+            "графическое ядро",
+            "видеопроцессор",
+            "графический процессор",
+            "видеоядро",
+            "integrated graphics",
+            "integrated gpu",
+            "igpu",
+            "graphics",
+        )
+
+        for raw_key, raw_value in _iter_component_specs(self.cpu):
+            key_norm   = _lookup_text(raw_key)
+            value_norm = _lookup_text(str(raw_value or ""))
+
+            key_is_igpu_related = any(
+                fragment in key_norm
+                for fragment in IGPU_SPEC_KEY_FRAGMENTS
+            )
+            if not key_is_igpu_related:
+                continue
+
+            if value_norm in IGPU_PRESENT_MARKERS:
+                return True
+
+            if value_norm in IGPU_ABSENT_MARKERS:
+                return False
+
+            if any(
+                brand in value_norm
+                for brand in (
+                    "radeon", "amd radeon",
+                    "intel uhd", "intel iris", "intel hd",
+                    "uhd graphics", "iris xe",
+                )
+            ):
+                return True
+
+        return None
+
+    def _detect_igpu_by_name(self, cpu_name_l: str) -> bool | None:
+        is_intel = any(
+            x in cpu_name_l
+            for x in ("intel", "core i", "core ultra", "pentium", "celeron", "xeon e")
+        )
+        if is_intel:
+            has_f_suffix = bool(re.search(IGPU_INTEL_EXCLUDE, cpu_name_l, re.I))
+            return not has_f_suffix
+
+        is_amd = any(x in cpu_name_l for x in ("ryzen", "amd athlon", "athlon"))
+        if is_amd:
+            if re.search(IGPU_AMD_PATTERN, cpu_name_l, re.I):
+                return True
+            m = re.search(r'ryzen\s*\d+\s+(\d{4})', cpu_name_l)
+            if m:
+                model_num = int(m.group(1))
+                return model_num >= 7000
+
+        return None
+
+    def _add_igpu_advisory(self, cpu_name: str) -> None:
+        self.result.advisory.append(Issue(
+            code="IGPU_ONLY_MODE",
+            title="Работа на встроенной графике CPU — производительность ограничена",
+            detail=(
+                f"Дискретная видеокарта не выбрана. "
+                f"CPU «{cpu_name}» имеет встроенную графику. "
+                f"Система будет использовать iGPU. "
+                f"Убедитесь, что в BIOS включён видеовыход: "
+                f"BIOS → Advanced → Integrated Graphics → Enabled / Auto."
+            ),
+            field="cpu"
+        ))
+
+    def _add_no_igpu_critical(self, cpu_name: str) -> None:
+        self.result.critical.append(Issue(
+            code="NO_GPU_NO_IGPU",
+            title="Система не выдаст изображение — нет GPU и нет iGPU в CPU",
+            detail=(
+                f"В сборке нет дискретной видеокарты, а CPU «{cpu_name}» "
+                f"не имеет встроенной графики. "
+                f"Добавьте дискретную GPU или замените CPU на модель с iGPU "
+                f"(Intel без суффикса F, AMD Ryzen G-серии, "
+                f"или любой Ryzen на сокете AM5)."
+            ),
+            field="gpu/cpu"
+        ))
 
     def check_ram_total_capacity(self):
         if not self.ram_sticks or not self.mb:
@@ -1342,7 +1357,7 @@ class BuildValidator:
         mb_max_gb = default_max.get((mb_ff, ram_type), 128)
 
         stick_gb = _int(_g(self.ram_sticks[0], "ramCapacity"), 0)
-        n        = len(self.ram_sticks)
+        n = len(self.ram_sticks)
 
         if total_gb > mb_max_gb:
             self.result.critical.append(Issue(
@@ -1368,10 +1383,6 @@ class BuildValidator:
                 field="ram"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  16. XMP / EXPO
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_xmp_expo(self):
         if not self.ram_sticks:
             return
@@ -1394,10 +1405,6 @@ class BuildValidator:
                     field="ram"
                 ))
                 break
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  17. БУТЫЛОЧНОЕ ГОРЛЫШКО
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_bottleneck(self):
         if not self.cpu or not self.gpus:
@@ -1444,10 +1451,6 @@ class BuildValidator:
                 field="cpu/gpu"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  18. WiFi / Bluetooth
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_wifi(self):
         if not self.mb:
             return
@@ -1475,9 +1478,6 @@ class BuildValidator:
                 field="mb"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  19. NVMe Gen4 / Gen5 — НАГРЕВ SSD
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_nvme_heatsink(self):
         if not self.ssds or not self.mb:
@@ -1537,10 +1537,6 @@ class BuildValidator:
                     field="ssd/mb"
                 ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  20. SATA SSD 2.5" В Mini-ITX КОРПУСЕ
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_sata_ssd_bay(self):
         if not self.ssds or not self.case:
             return
@@ -1565,14 +1561,17 @@ class BuildValidator:
                 ))
                 break
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  21. КПД БП: ЗОНА ЭФФЕКТИВНОСТИ
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_psu_efficiency_zone(self):
         psu_w   = _int(_g(self.psu, "psuWattage"), 0)
         cpu_tdp = _int(_g(self.cpu, "tdp"), 0)
         gpu_tdp = sum(_int(_g(g, "gpuTdp"), 0) for g in self.gpus)
+
+        if self.gpus and gpu_tdp == 0:
+            gpu_req = max((_int(_g(g, "gpuReqPsu"), 0) for g in self.gpus), default=0)
+            if gpu_req > 0:
+                gpu_tdp = int(gpu_req * 0.65)
+            else:
+                return
 
         if not psu_w or not (cpu_tdp or gpu_tdp):
             return
@@ -1602,10 +1601,6 @@ class BuildValidator:
                 field="psu"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  22. ОБЪЁМ VRAM
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_vram_adequacy(self):
         if not self.gpus:
             return
@@ -1625,20 +1620,6 @@ class BuildValidator:
                     ),
                     field="gpu"
                 ))
-            elif vram_gb >= VRAM_MIN_4K:
-                self.result.advisory.append(Issue(
-                    code="VRAM_4K_READY",
-                    title=f"VRAM {vram_gb} ГБ — видеокарта готова к 4K и AI-задачам",
-                    detail=(
-                        f"{vram_gb} ГБ VRAM достаточно для 4K-гейминга "
-                        f"и локального запуска LLM (до 7B параметров)."
-                    ),
-                    field="gpu"
-                ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  23. AIO: РАЗМЕР РАДИАТОРА vs КОРПУС
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_aio_radiator_vs_case(self):
         if not self.cooler or not self.case:
@@ -1646,7 +1627,7 @@ class BuildValidator:
         if _g(self.cooler, "coolerType", "") != "AIO":
             return
 
-        rad_size  = _int(_g(self.cooler, "aioRadiatorSize"), 0)
+        rad_size = _int(_g(self.cooler, "aioRadiatorSize"), 0)
         if not rad_size:
             return
 
@@ -1673,10 +1654,6 @@ class BuildValidator:
                 field="cooler/mb"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  24. AIO СВЕРХУ + ВЫСОКАЯ ОЗУ
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_aio_radiator_vs_ram(self):
         if not self.cooler or not self.ram_sticks:
             return
@@ -1702,10 +1679,6 @@ class BuildValidator:
                     field="cooler/ram"
                 ))
                 break
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  25. LGA1700 / LGA1851 — MOUNTING KIT
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_cooler_mounting_kit(self):
         if not self.cooler or not self.cpu:
@@ -1735,10 +1708,6 @@ class BuildValidator:
                 field="cooler"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  26. ИЗГИБ ТЕКСТОЛИТА INTEL LGA1700
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_intel_pcb_bend(self):
         if not self.cpu:
             return
@@ -1764,10 +1733,6 @@ class BuildValidator:
                 ),
                 field="cpu"
             ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  27. МОЩНЫЙ GPU — ДВА ОТДЕЛЬНЫХ КАБЕЛЯ
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_gpu_dual_cable(self):
         if not self.gpus or not self.psu:
@@ -1807,10 +1772,6 @@ class BuildValidator:
                     field="gpu/psu"
                 ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  28. FULL TOWER + КАБЕЛЬ ПИТАНИЯ CPU
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_cpu_cable_length_tower(self):
         if not self.psu or not self.case:
             return
@@ -1836,10 +1797,6 @@ class BuildValidator:
                 ),
                 field="psu/case"
             ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  29. INTEL K-CPU + НЕ Z-ЧИПСЕТ
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_intel_k_chipset(self):
         if not self.cpu or not self.mb:
@@ -1867,10 +1824,6 @@ class BuildValidator:
             ),
             field="cpu/mb"
         ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  30. AMD INFINITY FABRIC
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_infinity_fabric(self):
         if not self.cpu or not self.ram_sticks:
@@ -1910,10 +1863,6 @@ class BuildValidator:
                 ))
                 break
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  31. USB TYPE-C ПЕРЕДНЯЯ ПАНЕЛЬ vs Type-E header
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_usb_c_front_panel(self):
         if not self.case or not self.mb:
             return
@@ -1948,10 +1897,6 @@ class BuildValidator:
                 ),
                 field="case/mb"
             ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  32. ARGB (5V) vs RGB (12V)
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_argb_rgb_headers(self):
         if not self.mb:
@@ -1994,18 +1939,14 @@ class BuildValidator:
                 field="case/mb"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  33. ПОРЯДОК УСТАНОВКИ ОЗУ В СЛОТЫ
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_ram_population_order(self):
         if not self.ram_sticks or not self.mb:
             return
 
-        mb_slots = _get_mb_ram_slots(self.mb)
-        n_sticks = len(self.ram_sticks)
+        mb_slots       = _get_mb_ram_slots(self.mb)
+        total_physical = sum(_count_ram_modules(s) for s in self.ram_sticks)
 
-        if mb_slots == 4 and n_sticks == 2:
+        if mb_slots == 4 and total_physical == 2:
             self.result.advisory.append(Issue(
                 code="RAM_SLOT_POPULATION_ORDER",
                 title="2 планки ОЗУ в 4-слотовой плате: соблюдайте порядок установки",
@@ -2016,7 +1957,7 @@ class BuildValidator:
                 ),
                 field="ram/mb"
             ))
-        elif mb_slots == 2 and n_sticks == 1:
+        elif mb_slots == 2 and total_physical == 1:
             self.result.advisory.append(Issue(
                 code="RAM_SINGLE_STICK_TWO_SLOT",
                 title="1 планка ОЗУ в 2-слотовой плате: установите в рекомендованный слот",
@@ -2026,46 +1967,6 @@ class BuildValidator:
                 ),
                 field="ram/mb"
             ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  34. ECC ПАМЯТЬ НА ПОТРЕБИТЕЛЬСКОЙ ПЛАТЕ
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def check_ecc_ram_compatibility(self):
-        if not self.ram_sticks or not self.mb:
-            return
-
-        for stick in self.ram_sticks:
-            stick_name  = (stick.get("name")  or "").lower()
-            stick_specs = str(stick.get("specs") or {}).lower()
-
-            if "ecc" not in stick_name and "ecc" not in stick_specs:
-                continue
-
-            mb_name = (self.mb.get("name") or "").lower()
-            workstation_markers = (
-                "w790", "w680", "w680e", "trx50", "trx40", "sp3",
-                "pro ws", "workstation", "ws x570", "creator"
-            )
-            is_workstation = any(m in mb_name for m in workstation_markers)
-
-            if not is_workstation:
-                self.result.warning.append(Issue(
-                    code="ECC_RAM_ON_CONSUMER_MB",
-                    title="ECC-память на потребительской плате: коррекция ошибок не активна",
-                    detail=(
-                        "ECC работает только с чипсетами серверного класса "
-                        "(Intel W790, AMD TRX50, EPYC SP3). "
-                        "На потребительских Z/B/H платах ECC-модуль работает "
-                        "как обычная память без коррекции ошибок."
-                    ),
-                    field="ram/mb"
-                ))
-            break
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  35. СМЕШИВАНИЕ МОДУЛЕЙ ОЗУ
-    # ═══════════════════════════════════════════════════════════════════════
 
     def check_ram_mixing(self):
         if len(self.ram_sticks) < 2:
@@ -2157,15 +2058,12 @@ class BuildValidator:
                     field="ram"
                 ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  36. НЕСКОЛЬКО GPU
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_multi_gpu(self):
         if len(self.gpus) < 2:
             return
 
-        mb_pcie_slots = _int(_g(self.mb, "pcieX16Slots"), 1)
+        mb_pcie_slots = _get_mb_pcie_x16_slots(self.mb)
+
         if len(self.gpus) > mb_pcie_slots:
             self.result.critical.append(Issue(
                 code="MULTI_GPU_NO_SLOTS",
@@ -2196,7 +2094,8 @@ class BuildValidator:
             gpu_name = (gpu.get("name") or "").lower()
             if any(x in gpu_name for x in (
                 "rtx 40", "rtx40", "rtx 30", "rtx30",
-                "rx 7",   "rx7",   "rx 6",   "rx6"
+                "rx 7",   "rx7",   "rx 6",   "rx6",
+                "rtx 50", "rtx50",
             )):
                 self.result.advisory.append(Issue(
                     code="MULTI_GPU_NO_SLI_NVLINK",
@@ -2228,10 +2127,6 @@ class BuildValidator:
                 field="psu"
             ))
 
-    # ═══════════════════════════════════════════════════════════════════════
-    #  37. НЕСКОЛЬКО SSD
-    # ═══════════════════════════════════════════════════════════════════════
-
     def check_multi_ssd(self):
         if not self.ssds:
             return
@@ -2250,7 +2145,7 @@ class BuildValidator:
             if nvme_count > mb_m2_slots:
                 self.result.critical.append(Issue(
                     code="MULTI_SSD_NO_M2_SLOTS",
-                    title=f"Недостаточно M.2 слотов: нужно {nvme_count}, на плате {mb_m2_slots}",
+                    title=f"Недостаточно M.2 слотов: выбрано {nvme_count}, на плате {mb_m2_slots}",
                     detail=(
                         f"Выбрано {nvme_count} NVMe SSD, "
                         f"плата имеет {mb_m2_slots} слот(а) M.2. "
@@ -2275,7 +2170,7 @@ class BuildValidator:
             if sata_count > mb_sata_ports:
                 self.result.critical.append(Issue(
                     code="MULTI_SSD_NO_SATA_PORTS",
-                    title=f"Недостаточно SATA портов: нужно {sata_count}, на плате {mb_sata_ports}",
+                    title=f"Недостаточно SATA портов: выбрано {sata_count}, на плате {mb_sata_ports}",
                     detail=(
                         f"Выбрано {sata_count} SATA накопителя, "
                         f"плата имеет {mb_sata_ports} SATA порта. "
@@ -2300,10 +2195,6 @@ class BuildValidator:
                 ),
                 field="ssd"
             ))
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  СВОДКА
-    # ═══════════════════════════════════════════════════════════════════════
 
     def _build_summary(self):
         cpu_tdp      = _int(_g(self.cpu, "tdp"), 0)
@@ -2334,11 +2225,6 @@ class BuildValidator:
             "warningCount":    len(self.result.warning),
             "advisoryCount":   len(self.result.advisory),
         }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  ПУБЛИЧНЫЙ API
-# ═══════════════════════════════════════════════════════════════════════════
 
 def check_compatibility(components: dict) -> dict:
     try:

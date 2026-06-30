@@ -21,7 +21,6 @@ from camoufox.async_api import AsyncCamoufox
 
 from parser_engine import _extract_logic
 
-# Используем локальный логгер модуля, чтобы не ломать поток логирования FastAPI/Uvicorn
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.dns-shop.ru"
@@ -435,8 +434,131 @@ def _absolute_url(href: str) -> str:
 def _image_from_src(src: str) -> str:
     if not src:
         return ""
-    src = src.split(" 1x")[0].split(",")[0].strip()
+    # srcset: "url1 1x, url2 2x" → берём url1
+    src = src.split(" ")[0].split(",")[0].strip()
+    if not src or src.startswith("data:"):
+        return ""
     return _absolute_url(src)
+
+
+def _upscale_dns_thumb(url: str, size: int = 600) -> str:
+    return re.sub(r"/fit/\d+/\d+/", f"/fit/{size}/{size}/", url)
+
+
+async def _extract_detail_page_image(tab: Any) -> str:
+    try:
+        strip_items = await _eles(tab, "picture.product-images-slider__item")
+        for pic in strip_items:
+            # Сначала source[srcset] — webp лучше качеством
+            source_el = await _ele(pic, "source[srcset]", timeout=0.2)
+            if source_el:
+                srcset = await _attr(source_el, "srcset")
+                url = _upscale_dns_thumb(_image_from_src(srcset))
+                if url:
+                    log.debug("[DNS] Image from strip source[srcset]: %s", url[:80])
+                    return url
+
+            # Потом img
+            img_el = await _ele(pic, "img", timeout=0.2)
+            if img_el:
+                src = (
+                    await _attr(img_el, "data-src")
+                    or await _attr(img_el, "src")
+                )
+                url = _upscale_dns_thumb(_image_from_src(src))
+                if url:
+                    log.debug("[DNS] Image from strip img: %s", url[:80])
+                    return url
+    except Exception:
+        pass
+
+    try:
+        source_el = await _ele(
+            tab,
+            "picture.product-images-slider__main source[srcset]",
+            timeout=2.0,
+        )
+        if source_el:
+            srcset = await _attr(source_el, "srcset")
+            url = _image_from_src(srcset)
+            if url:
+                log.debug("[DNS] Image from main slider source[srcset]: %s", url[:80])
+                return url
+    except Exception:
+        pass
+
+    try:
+        img_el = await _ele(
+            tab,
+            "picture.product-images-slider__main img",
+            timeout=1.0,
+        )
+        if img_el:
+            src = (
+                await _attr(img_el, "data-src")
+                or await _attr(img_el, "srcset")
+                or await _attr(img_el, "src")
+            )
+            url = _image_from_src(src)
+            if url:
+                log.debug("[DNS] Image from main slider img: %s", url[:80])
+                return url
+    except Exception:
+        pass
+
+    try:
+        for attempt in range(8):  # 8 × 0.5с = до 4 секунд
+            src3d_source = await _ele(
+                tab,
+                ".slider3d-image__image-wrap source[srcset]",
+                timeout=0.3,
+            )
+            if src3d_source:
+                srcset = await _attr(src3d_source, "srcset")
+                url = _image_from_src(srcset)
+                if url:
+                    log.debug(
+                        "[DNS] Image from 3D slider source[srcset] (attempt %d): %s",
+                        attempt, url[:80],
+                    )
+                    return url
+
+            img3d = await _ele(tab, ".slider3d-image__img", timeout=0.3)
+            if img3d:
+                src = (
+                    await _attr(img3d, "data-src")
+                    or await _attr(img3d, "srcset")
+                    or await _attr(img3d, "src")
+                )
+                url = _image_from_src(src)
+                if url:
+                    log.debug(
+                        "[DNS] Image from 3D slider img (attempt %d): %s",
+                        attempt, url[:80],
+                    )
+                    return url
+
+            await asyncio.sleep(0.5)
+    except Exception:
+        pass
+
+    try:
+        meta_el = await _ele(tab, 'meta[property="og:image"]', timeout=1.5)
+        if meta_el:
+            content = await _attr(meta_el, "content")
+            if content:
+                url = _absolute_url(content)
+                log.debug("[DNS] Image from og:image: %s", url[:80])
+                return url
+    except Exception:
+        pass
+
+    try:
+        page_url = tab.url
+    except Exception:
+        page_url = "unknown"
+    log.warning("[DNS] Could not extract any image from product page: %s", page_url)
+    return ""
 
 
 def _product_to_characteristics_url(product_url: str) -> str:
@@ -600,45 +722,89 @@ async def _wait_for_catalog(page: Any, category_name: str) -> bool:
 
 async def _extract_product_card(card: Any, category_name: str) -> dict[str, Any] | None:
     try:
-        link_el = await _first(card, PRODUCT_NAME_SELECTORS, timeout=0.5)
-        if not link_el:
+        data = await card.evaluate(
+            """
+            (card) => {
+                const nameSelectors = [
+                    'a.catalog-product__name',
+                    '.catalog-product__name a',
+                    '.catalog-product__name',
+                    'a[href*="/product/"]'
+                ];
+                let linkEl = null;
+                for (const sel of nameSelectors) {
+                    linkEl = card.querySelector(sel);
+                    if (linkEl) break;
+                }
+                if (!linkEl) return null;
+
+                let href = linkEl.getAttribute('href') || '';
+                if (!href) {
+                    const nested = linkEl.querySelector('a[href*="/product/"]');
+                    href = nested ? (nested.getAttribute('href') || '') : '';
+                }
+
+                const name = linkEl.getAttribute('title')
+                    || linkEl.getAttribute('aria-label')
+                    || (linkEl.textContent || '').trim();
+
+                const imgSelectors = [
+                    '.catalog-product__image img',
+                    'img[data-src]',
+                    'img[src]',
+                    'source[srcset]'
+                ];
+                let imageUrl = '';
+                for (const sel of imgSelectors) {
+                    const img = card.querySelector(sel);
+                    if (!img) continue;
+                    const src = img.getAttribute('data-src')
+                        || img.getAttribute('srcset')
+                        || img.getAttribute('src');
+                    if (src) { imageUrl = src; break; }
+                }
+
+                const priceSelectors = [
+                    '.product-buy__price',
+                    '[class*="product-buy__price"]',
+                    '[data-role="price"]',
+                    '[itemprop="price"]'
+                ];
+                let priceText = '';
+                for (const sel of priceSelectors) {
+                    const el = card.querySelector(sel);
+                    if (!el) continue;
+                    priceText = (el.getAttribute('content') || el.textContent || '').trim();
+                    if (priceText) break;
+                }
+                if (!priceText) {
+                    priceText = card.innerHTML;
+                }
+
+                const code = card.getAttribute('data-code') || '';
+                const dnsUuid = card.getAttribute('data-product')
+                    || card.getAttribute('data-entity') || '';
+
+                return { href, name, imageUrl, priceText, code, dnsUuid };
+            }
+            """
+        )
+
+        if not data or not data.get("href") or not data.get("name"):
             return None
 
-        href = await _attr(link_el, "href")
-        if not href:
-            nested_link = await _ele(link_el, "a[href*='/product/']", timeout=0.2)
-            href = await _attr(nested_link, "href") if nested_link else ""
-
-        product_url = _absolute_url(href)
+        product_url = _absolute_url(data["href"])
         if "/product/" not in product_url:
             return None
 
-        name = (
-            await _attr(link_el, "title")
-            or await _attr(link_el, "aria-label")
-            or await _text(link_el)
-        )
-        name = _clean_text(name)
+        name = _clean_text(data["name"])
         if not name or len(name) < 5:
             return None
 
-        image_url = ""
-        for selector in IMAGE_SELECTORS:
-            img_el = await _ele(card, selector, timeout=0.2)
-            if not img_el:
-                continue
-            src = (
-                await _attr(img_el, "data-src")
-                or await _attr(img_el, "srcset")
-                or await _attr(img_el, "src")
-            )
-            image_url = _image_from_src(src)
-            if image_url:
-                break
-
-        price = await _extract_price(card)
-        code = await _attr(card, "data-code")
-        dns_uuid = await _attr(card, "data-product") or await _attr(card, "data-entity")
+        image_url = _image_from_src(data.get("imageUrl") or "")
+        price = _extract_price_from_text(data.get("priceText") or "")
+        code = data.get("code") or ""
+        dns_uuid = data.get("dnsUuid") or ""
 
         return {
             "id": _stable_id(name, _public_category(category_name), code),
@@ -883,6 +1049,18 @@ async def _collect_price_from_product_page(page: Any) -> str:
         return "---"
 
 
+async def _extract_canonical_name(tab: Any) -> str:
+    try:
+        h1 = await _ele(tab, "[data-product-title]", timeout=2.0)
+        if h1:
+            text = _clean_text(await _text(h1))
+            if text and len(text) >= 5:
+                return text
+    except Exception:
+        pass
+    return ""
+
+
 async def _process_batch_dns(
         product_data: list[dict[str, Any]],
         category_name: str,
@@ -905,17 +1083,14 @@ async def _process_batch_dns(
         for product in product_data:
             tab = None
             try:
-                # Добавлен timeout для создания страницы
                 tab = await asyncio.wait_for(_new_page(context, block_images=True), timeout=10.0)
                 target = _product_to_characteristics_url(product["url"])
 
-                # Попытка перехода с защитой
                 response = await _goto_with_retries(tab, target, product["name"][:45])
                 if response is None:
                     await _safe_close(tab)
                     continue
 
-                # --- Сбор данных с защитой ---
                 try:
                     await tab.wait_for_load_state("domcontentloaded", timeout=10000)
                     await _human_warmup(tab)
@@ -926,19 +1101,36 @@ async def _process_batch_dns(
                         await _goto_with_retries(tab, product["url"], "retry_specs")
                         specs = await _collect_specs_dns(tab)
 
+                    canonical_name = await _extract_canonical_name(tab)
+                    final_name = canonical_name or product["name"]
+                    if canonical_name and canonical_name != product["name"]:
+                        log.warning(
+                            "[DNS] Имя с каталога не совпало со страницей товара (%s) — "
+                            "беру название со страницы: '%s' -> '%s'",
+                            product.get("url", "")[:60],
+                            product["name"][:60],
+                            canonical_name[:60],
+                        )
+
                     price_text = product.get("price_from_catalog", "---")
                     if price_text == "---":
                         price_text = await _collect_price_from_product_page(tab)
 
+                    image_url = product.get("image", "")
+                    if not image_url:
+                        image_url = await _extract_detail_page_image(tab)
+
                     public_category = _public_category(category_name)
-                    extracted = _extract_logic(_logic_category(category_name), product["name"], specs)
+                    extracted = _extract_logic(_logic_category(category_name), final_name, specs)
 
                     results.append({
-                        "id": product.get("id") or _stable_id(product["name"], public_category),
-                        "name": product["name"],
+                        "id": product.get("id") or _stable_id(final_name, public_category),
+                        "name": final_name,
                         "category": public_category,
                         "priceDNS": price_text,
                         "price": price_text,
+                        "imageUrl": image_url,
+                        "productUrl": product.get("url", ""),
                         "source": "dns",
                         **extracted,
                         "specs": specs,
@@ -949,7 +1141,7 @@ async def _process_batch_dns(
                     log.error("[DNS] Ошибка парсинга характеристик для %s: %s", product["name"][:30], e)
 
             except Exception as e:
-                log.error("[DNS] Ошибка при обработке вкладки %s: %s", product.get("name")[:30], e)
+                log.error("[DNS] Ошибка при обработке вкладки %s: %s", product.get("name", "")[:30], e)
             finally:
                 if tab:
                     await _safe_close(tab)
@@ -965,12 +1157,8 @@ async def _process_batch_dns(
 
 
 async def scrape_dns(url: str, category_name: str) -> list[dict[str, Any]]:
-    """
-    Основная точка входа для парсинга категории DNS из внешних модулей (main.py).
-    """
     log.info("[DNS] Начинаю парсинг категории '%s' -> %s", category_name, url)
 
-    # Шаг 1: Собираем список ссылок и базовых данных из страниц каталога
     catalog_products = await _collect_catalog_dns(url, category_name)
     if not catalog_products:
         log.warning("[DNS/%s] Не найдено товаров в каталоге или сработал блок.", category_name)
@@ -978,10 +1166,9 @@ async def scrape_dns(url: str, category_name: str) -> list[dict[str, Any]]:
 
     log.info("[DNS/%s] Фаза 2: сбор характеристик %d товаров...", category_name, len(catalog_products))
 
-    # Шаг 2: Разбиваем список на пачки (batches) и обходим страницы товаров
     final_results = []
     for i in range(0, len(catalog_products), BATCH_SIZE):
-        batch = catalog_products[i : i + BATCH_SIZE]
+        batch = catalog_products[i: i + BATCH_SIZE]
         batch_res = await _process_batch_dns(batch, category_name)
         final_results.extend(batch_res)
         if i + BATCH_SIZE < len(catalog_products):
@@ -992,9 +1179,6 @@ async def scrape_dns(url: str, category_name: str) -> list[dict[str, Any]]:
 
 
 async def scrape_dns_catalogs() -> dict[str, list[dict[str, Any]]]:
-    """
-    Последовательный полный цикл обхода всех зарегистрированных категорий DNS.
-    """
     all_data = {}
     for cat_name, cat_url in URLS_DNS.items():
         all_data[cat_name] = await scrape_dns(cat_url, cat_name)
